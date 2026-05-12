@@ -62,12 +62,10 @@ DEFAULT_ITEMS_PER_PAGE = 50  # per advanced-search page
 DEFAULT_MAX_COMPANIES = 100  # hard cap to avoid huge runs and rate-limit issues
 REQUEST_SLEEP_SECONDS = 0.1  # small delay between requests as a courtesy
 
-
 # Toggle for rotating across multiple API keys.
 # IMPORTANT: Companies House explicitly warns against using multiple keys
 # for the same live application to circumvent rate limiting. Use rotation
-# only if you have a legitimate multi-key setup (e.g. separate test/prod apps)
-# and have cleared this with Companies House if needed.
+# only if you have a legitimate multi-key setup (e.g. separate test/prod apps).
 ENABLE_KEY_ROTATION = False
 
 
@@ -80,23 +78,28 @@ def load_api_keys() -> List[str]:
     """
     Load up to 3 Companies House API keys from Streamlit secrets or environment variables.
 
-    Streamlit secrets (preferred):
+    Preferred (per-project secrets):
+        .streamlit/secrets.toml in your working directory:
+        [ch_api]
+        keys = ["KEY1", "KEY2", "KEY3"]
 
-    [ch_api]
-    keys = ["KEY1", "KEY2", "KEY3"]
+    Also works with global secrets at ~/.streamlit/secrets.toml.[web:22]
 
-    Fallback: environment variables COMPANIES_HOUSE_API_KEY_1..3.
+    Fallback: environment variables:
+        COMPANIES_HOUSE_API_KEY_1, COMPANIES_HOUSE_API_KEY_2, COMPANIES_HOUSE_API_KEY_3
     """
     keys: List[str] = []
 
-    # Preferred: Streamlit secrets
+    # Preferred: Streamlit secrets (project or global)
     try:
         if "ch_api" in st.secrets and "keys" in st.secrets["ch_api"]:
             raw_keys = st.secrets["ch_api"]["keys"]
             if isinstance(raw_keys, (list, tuple)):
-                keys.extend([k.strip() for k in raw_keys if isinstance(k, str) and k.strip()])
+                keys.extend(
+                    [k.strip() for k in raw_keys if isinstance(k, str) and k.strip()]
+                )
     except Exception:
-        # st.secrets may not be available outside Streamlit Cloud / CLI environment
+        # st.secrets may not be available in some environments
         pass
 
     # Fallback: environment variables
@@ -111,7 +114,7 @@ def load_api_keys() -> List[str]:
 
 def get_next_api_key(api_keys: List[str]) -> str:
     """
-    Select an API key.
+    Select an API key for this search run.
 
     If rotation is disabled or there is only one key, always return the first.
     If rotation is enabled, rotate across keys per search run using session_state.
@@ -139,7 +142,7 @@ def ch_get(
     """
     Make a GET request to the Companies House API with Basic auth.
 
-    The API key is sent as the username with a blank password.
+    The API key is sent as the username with a blank password.[web:35]
     """
     url = CH_API_BASE_URL + path
     resp = requests.get(url, auth=(api_key, ""), params=params, timeout=timeout)
@@ -195,8 +198,8 @@ def search_companies_advanced(
     Use the Companies House advanced search endpoint to fetch companies
     incorporated within a date range.
 
-    This uses the incorporated_from / incorporated_to filters exposed by the
-    /advanced-search/companies endpoint.[web:1]
+    Uses the incorporated_from / incorporated_to filters on
+    /advanced-search/companies.[web:1]
     """
     companies: List[Dict[str, Any]] = []
     start_index = 0
@@ -242,8 +245,9 @@ def fetch_company_officers(
     items_per_page: int = 100,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch the officers for a given company number using the /company/{company_number}/officers
-    endpoint, which exposes country_of_residence for each officer.[web:11]
+    Fetch the officers for a given company number using the
+    /company/{company_number}/officers endpoint, which exposes
+    country_of_residence for each officer.[web:11]
     """
     officers: List[Dict[str, Any]] = []
     start_index = 0
@@ -258,7 +262,7 @@ def fetch_company_officers(
         resp = ch_get(path, api_key=api_key, params=params)
         if resp.status_code != 200:
             # For many use cases, a 404 or similar just means no officers / restricted;
-            # we treat that as "no officers" rather than hard failing.
+            # treat that as "no officers" rather than hard failing.
             break
 
         data = resp.json()
@@ -285,7 +289,7 @@ def find_companies_with_director_country(
 ) -> List[Dict[str, Any]]:
     """
     For each company in the list, fetch officers and keep companies that have
-    at least one officer with country_of_residence == selected_country (approx.).
+    at least one officer with country_of_residence matching the selected country.
     """
     results: List[Dict[str, Any]] = []
     scanned = 0
@@ -299,13 +303,11 @@ def find_companies_with_director_country(
             continue
 
         officers = fetch_company_officers(company_number, api_key=api_key)
-
         matching_officers = [
             o for o in officers if officer_matches_country(o, selected_country)
         ]
 
         if matching_officers:
-            # Take a subset of fields for display
             incorporation_date = company.get("date_of_creation")
             inc_date_parsed = parse_iso_date(incorporation_date)
             inc_date_str = (
@@ -319,7 +321,6 @@ def find_companies_with_director_country(
                     "incorporation_date": inc_date_str,
                     "director_country_of_residence": selected_country,
                     "matching_officer_count": len(matching_officers),
-                    # For convenience, include the name of the first matching officer
                     "example_officer_name": matching_officers[0]
                     .get("name", "")
                     .title()
@@ -353,9 +354,9 @@ This app queries the UK Companies House Public Data API to find companies
 incorporated within a date range that have at least one director whose
 **country of residence** matches a selected country.
 
-Results are based on the Companies House advanced search endpoint and officer
-list endpoint, which expose `incorporated_from` / `incorporated_to` filters
-and `country_of_residence` for officers respectively.[web:1][web:11]
+It uses the Companies House advanced search endpoint and the company officers
+endpoint, which expose `incorporated_from` / `incorporated_to` filters and
+`country_of_residence` respectively.[web:1][web:11]
         """
     )
 
@@ -363,7 +364,8 @@ and `country_of_residence` for officers respectively.[web:1][web:11]
     if not api_keys:
         st.error(
             "No Companies House API keys configured. "
-            "Set them via Streamlit secrets or environment variables as described in the README."
+            "Set them via Streamlit secrets (.streamlit/secrets.toml) or environment "
+            "variables COMPANIES_HOUSE_API_KEY_1..3."
         )
         st.stop()
 
@@ -392,13 +394,13 @@ and `country_of_residence` for officers respectively.[web:1][web:11]
         )
 
         max_companies = st.number_input(
-            "Maximum companies to fetch (from Companies House)",
+            "Maximum companies to fetch (from advanced search)",
             min_value=10,
             max_value=500,
             value=DEFAULT_MAX_COMPANIES,
             step=10,
-            help="Upper bound on companies fetched from advanced search to avoid "
-            "hitting API rate limits.",
+            help="Upper bound on companies fetched from advanced search to help "
+            "stay within API rate limits.",
         )
 
         max_companies_to_scan = st.number_input(
@@ -407,7 +409,7 @@ and `country_of_residence` for officers respectively.[web:1][web:11]
             max_value=int(max_companies),
             value=min(DEFAULT_MAX_COMPANIES, int(max_companies)),
             step=10,
-            help="Upper bound on how many companies we will inspect for matching officers.",
+            help="Upper bound on how many companies we'll inspect for matching officers.",
         )
 
         items_per_page = st.slider(
@@ -416,14 +418,15 @@ and `country_of_residence` for officers respectively.[web:1][web:11]
             max_value=100,
             value=DEFAULT_ITEMS_PER_PAGE,
             step=10,
-            help="Number of companies per API page from the advanced search endpoint.",
+            help="Number of companies per page from the advanced search endpoint.",
         )
 
         advanced_options = st.expander("Advanced options", expanded=False)
         with advanced_options:
             st.write(
-                "Companies House applies rate limits of 600 requests per 5 minutes per REST API key. "
-                "This app adds small delays between requests and caps the number of companies to help stay within those limits.[web:3][web:12]"
+                "Companies House applies rate limits of 600 requests per 5 minutes per "
+                "REST API key. This app adds small delays between requests and caps the "
+                "number of companies to help stay within those limits.[web:3][web:12]"
             )
 
         run_search = st.button("Run search")
@@ -431,10 +434,10 @@ and `country_of_residence` for officers respectively.[web:1][web:11]
     st.markdown("---")
 
     if not run_search:
-        st.info("Configure your parameters in the sidebar and click **Run search**.")
+        st.info("Configure parameters in the sidebar and click **Run search**.")
         return
 
-    # Each search run can use a selected (or rotated) API key.
+    # Each search run uses a selected (or rotated) API key.
     active_api_key = get_next_api_key(api_keys)
 
     incorporated_from_str = start_date.isoformat()
@@ -477,7 +480,8 @@ and `country_of_residence` for officers respectively.[web:1][web:11]
 
     if not results:
         st.warning(
-            f"No companies in the fetched set had officers with country_of_residence matching {selected_country}."
+            f"No companies in the fetched set had officers with country_of_residence "
+            f"matching {selected_country}."
         )
         return
 
