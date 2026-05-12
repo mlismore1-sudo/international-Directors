@@ -1,506 +1,471 @@
-import os
-import time
-from datetime import date
-from typing import List, Dict, Any, Optional
+import base64
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
+import pandas as pd
 import requests
 import streamlit as st
-from dateutil.parser import parse as parse_date
 
-# -----------------------------
-# Configuration
-# -----------------------------
+st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
 
-# Allowed director countries of residence for the UI
-ALLOWED_COUNTRIES = [
-    "Finland",
-    "Sweden",
-    "Denmark",
-    "Norway",
-    "Germany",
-    "Poland",
-    "Spain",
-    "France",
-    "Italy",
-    "Belgium",
-    "Netherlands",
-    "USA",
-    "Hong Kong",
-]
-
-# Basic synonym mapping for officer.country_of_residence free-text values.
-# Keys are the user-facing options; values are lists of acceptable variants.
-COUNTRY_SYNONYMS = {
-    "Finland": ["Finland"],
-    "Sweden": ["Sweden"],
-    "Denmark": ["Denmark"],
-    "Norway": ["Norway"],
-    "Germany": ["Germany"],
-    "Poland": ["Poland"],
-    "Spain": ["Spain"],
-    "France": ["France"],
-    "Italy": ["Italy"],
-    "Belgium": ["Belgium"],
-    "Netherlands": ["Netherlands", "Holland"],
-    "USA": [
-        "USA",
-        "U.S.A.",
-        "US",
-        "U.S.",
-        "United States",
-        "United States of America",
-        "America",
-    ],
-    "Hong Kong": ["Hong Kong", "HONG KONG", "HongKong"],
+TARGET_DIRECTOR_COUNTRIES = {
+    "france",
+    "germany",
+    "spain",
+    "norway",
+    "italy",
+    "sweden",
+    "netherlands",
+    "belgium",
+    "finland",
+    "denmark",
+    "poland",
+    "portugal",
+    "usa",
+    "united states",
+    "united states of america",
+    "india",
+    "hong kong",
 }
 
-# Companies House API configuration
-CH_API_BASE_URL = "https://api.company-information.service.gov.uk"
-
-# Safety controls for advanced search
-DEFAULT_PAGE_SIZE = 500      # 'size' param for advanced search (1–5000 typical)
-DEFAULT_MAX_RESULTS = 5000   # max total companies to fetch per query (API hard limit is 10000)
-REQUEST_SLEEP_SECONDS = 0.1  # small delay between requests as a courtesy
-
-# Toggle for rotating across multiple API keys.
-# Use rotation only if you have a legitimate multi-key setup (e.g. separate test/prod apps).
-ENABLE_KEY_ROTATION = False
-
-
-# -----------------------------
-# Helper functions
-# -----------------------------
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+LEADS_DIR = DATA_DIR / "leads"
+LEADS_DIR.mkdir(exist_ok=True)
+TEAM_MEMBERS = ["Brad", "James"]
+QUICK_ADD_DEFAULT = 15
+RESULT_COLUMNS = [
+    "company_number",
+    "company_name",
+    "sector",
+    "time_added_to_table",
+    "pull_order",
+]
+LEAD_COLUMNS = ["company_number", "company_name", "sector", "added_by", "added_at"]
 
 
-def load_api_keys() -> List[str]:
-    """
-    Load up to 3 Companies House API keys from Streamlit secrets or environment variables.
+def today_uk_str() -> str:
+    return datetime.now().astimezone().date().isoformat()
 
-    Preferred (per-project secrets):
-        .streamlit/secrets.toml in your working directory:
-        [ch_api]
-        keys = ["KEY1", "KEY2", "KEY3"]
 
-    Fallback: environment variables:
-        COMPANIES_HOUSE_API_KEY_1, COMPANIES_HOUSE_API_KEY_2, COMPANIES_HOUSE_API_KEY_3
-    """
+def now_uk_str() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_api_keys() -> List[str]:
     keys: List[str] = []
+    list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
+    if list_style_keys:
+        keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
+    for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
+        value = st.secrets.get(key_name, "")
+        if value:
+            keys.append(str(value).strip())
+    deduped_keys = []
+    seen = set()
+    for key in keys:
+        if key and key not in seen:
+            deduped_keys.append(key)
+            seen.add(key)
+    return deduped_keys
 
-    # Preferred: Streamlit secrets (project or global)
+
+def auth_header(api_key: str) -> Dict[str, str]:
+    token = base64.b64encode(f"{api_key}:".encode()).decode()
+    return {
+        "Authorization": f"Basic {token}",
+        "User-Agent": "streamlit-companies-house-today-app",
+    }
+
+
+def normalize_country(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def classify_country_match(officer_countries: Set[str]) -> Optional[str]:
+    ordered_labels = [
+        ("France", {"france"}),
+        ("Germany", {"germany"}),
+        ("Spain", {"spain"}),
+        ("Norway", {"norway"}),
+        ("Italy", {"italy"}),
+        ("Sweden", {"sweden"}),
+        ("Netherlands", {"netherlands"}),
+        ("Belgium", {"belgium"}),
+        ("Finland", {"finland"}),
+        ("Denmark", {"denmark"}),
+        ("Poland", {"poland"}),
+        ("Portugal", {"portugal"}),
+        ("USA", {"usa", "united states", "united states of america"}),
+        ("India", {"india"}),
+        ("Hong Kong", {"hong kong"}),
+    ]
+    for label, country_values in ordered_labels:
+        if officer_countries & country_values:
+            return label
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_session() -> requests.Session:
+    return requests.Session()
+
+
+def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], timeout: int = 30) -> requests.Response:
+    session = get_session()
+    last_response = None
+    for api_key in api_keys:
+        response = session.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
+        if response.status_code in (401, 429):
+            last_response = response
+            continue
+        response.raise_for_status()
+        return response
+    if last_response is not None:
+        last_response.raise_for_status()
+    raise RuntimeError("No valid Companies House API keys were available.")
+
+
+def fetch_company_officers(company_number: str, api_keys: List[str]) -> List[dict]:
+    url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
+    params = {"items_per_page": "100"}
+    response = fetch_with_rotation(url, params, api_keys)
+    payload = response.json()
+    return payload.get("items", []) or []
+
+
+def get_matching_director_countries(company_number: str, api_keys: List[str]) -> Set[str]:
     try:
-        if "ch_api" in st.secrets and "keys" in st.secrets["ch_api"]:
-            raw_keys = st.secrets["ch_api"]["keys"]
-            if isinstance(raw_keys, (list, tuple)):
-                keys.extend(
-                    [k.strip() for k in raw_keys if isinstance(k, str) and k.strip()]
-                )
-    except Exception:
-        # st.secrets may not be available in some environments
-        pass
+        officers = fetch_company_officers(company_number, api_keys)
+    except requests.HTTPError:
+        return set()
 
-    # Fallback: environment variables
-    if not keys:
-        for i in range(1, 4):
-            env_key = os.getenv(f"COMPANIES_HOUSE_API_KEY_{i}")
-            if env_key and env_key.strip():
-                keys.append(env_key.strip())
+    matches: Set[str] = set()
 
-    return keys
+    for officer in officers:
+        officer_role = str(officer.get("officer_role", "")).strip().lower()
+        if officer_role not in {"director", "llp-member"}:
+            continue
 
+        resigned_on = str(officer.get("resigned_on", "")).strip()
+        if resigned_on:
+            continue
 
-def get_next_api_key(api_keys: List[str]) -> str:
-    """
-    Select an API key for this search run.
+        country = normalize_country(officer.get("country_of_residence", ""))
+        if country and country in TARGET_DIRECTOR_COUNTRIES:
+            matches.add(country)
 
-    If rotation is disabled or there is only one key, always return the first.
-    If rotation is enabled, rotate across keys per search run using session_state.
-    """
-    if not api_keys:
-        raise RuntimeError("No Companies House API keys configured.")
-
-    if not ENABLE_KEY_ROTATION or len(api_keys) == 1:
-        return api_keys[0]
-
-    if "api_key_index" not in st.session_state:
-        st.session_state["api_key_index"] = 0
-
-    idx = st.session_state["api_key_index"] % len(api_keys)
-    st.session_state["api_key_index"] += 1
-    return api_keys[idx]
+    return matches
 
 
-def ch_get(
-    path: str,
-    api_key: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: int = 15,
-) -> requests.Response:
-    """
-    Make a GET request to the Companies House API with Basic auth.
-
-    The API key is sent as the username with a blank password.
-    """
-    url = CH_API_BASE_URL + path
-    resp = requests.get(url, auth=(api_key, ""), params=params, timeout=timeout)
-    return resp
-
-
-def normalise_country(text: Optional[str]) -> str:
-    """Normalise a free-text country string for comparison."""
-    if not text:
-        return ""
-    return text.strip().lower()
-
-
-def officer_matches_country(officer: Dict[str, Any], selected_country: str) -> bool:
-    """
-    Determine if an officer's country_of_residence matches the selected country
-    using a small synonym map and case-insensitive comparison.
-    """
-    cor_raw = officer.get("country_of_residence")
-    cor_norm = normalise_country(cor_raw)
-    if not cor_norm:
-        return False
-
-    synonyms = COUNTRY_SYNONYMS.get(selected_country, [selected_country])
-    synonyms_norm = [s.lower() for s in synonyms]
-    return cor_norm in synonyms_norm
-
-
-def parse_iso_date(text: str) -> Optional[date]:
-    """Parse a YYYY-MM-DD string safely to a date object."""
-    if not text:
-        return None
-    try:
-        return parse_date(text).date()
-    except Exception:
-        return None
-
-
-# -----------------------------
-# API wrappers
-# -----------------------------
-
-
-@st.cache_data(show_spinner=False)
-def search_companies_advanced(
-    incorporated_from: str,
-    incorporated_to: str,
-    max_results: int,
-    page_size: int,
-    api_key: str,
-) -> List[Dict[str, Any]]:
-    """
-    Use the Companies House advanced search endpoint to fetch companies
-    incorporated within a date range.
-
-    Uses the incorporated_from / incorporated_to filters on
-    /advanced-search/companies, and paginates using 'size' + 'start_index'.
-    """
-    companies: List[Dict[str, Any]] = []
+def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd.DataFrame:
+    url = "https://api.company-information.service.gov.uk/advanced-search/companies"
     start_index = 0
-
-    while len(companies) < max_results:
-        params = {
-            "incorporated_from": incorporated_from,
-            "incorporated_to": incorporated_to,
-            # IMPORTANT: advanced search uses 'size', not 'items_per_page'.
-            "size": page_size,
-            "start_index": start_index,
-        }
-
-        resp = ch_get("/advanced-search/companies", api_key=api_key, params=params)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Advanced search failed with status {resp.status_code}: {resp.text}"
-            )
-
-        data = resp.json()
-        items = data.get("items", []) or []
-        if not items:
-            # no more results
-            break
-
-        for item in items:
-            companies.append(item)
-            if len(companies) >= max_results:
-                break
-
-        # If we received fewer than page_size items, we've hit the last page
-        if len(items) < page_size or len(companies) >= max_results:
-            break
-
-        # Move the window forward
-        start_index += page_size
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    return companies
-
-
-@st.cache_data(show_spinner=False)
-def fetch_company_officers(
-    company_number: str,
-    api_key: str,
-    items_per_page: int = 100,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch the officers for a given company number using the
-    /company/{company_number}/officers endpoint, which exposes
-    country_of_residence for each officer.
-    """
-    officers: List[Dict[str, Any]] = []
-    start_index = 0
+    page_size = 100
+    rows = []
+    pull_counter = 0
 
     while True:
         params = {
-            "items_per_page": items_per_page,
-            "start_index": start_index,
+            "incorporated_from": run_date,
+            "incorporated_to": run_date,
+            "size": str(page_size),
+            "start_index": str(start_index),
         }
+        response = fetch_with_rotation(url, params, api_keys)
+        payload = response.json()
+        items = payload.get("items", []) or []
 
-        path = f"/company/{company_number}/officers"
-        resp = ch_get(path, api_key=api_key, params=params)
-        if resp.status_code != 200:
-            # For many use cases, a 404 or similar just means no officers / restricted;
-            # treat that as "no officers" rather than hard failing.
+        for item in items:
+            company_number = str(item.get("company_number", "")).strip()
+            company_name = str(item.get("company_name", "")).strip()
+            if not company_number:
+                continue
+
+            matching_countries = get_matching_director_countries(company_number, api_keys)
+            sector = classify_country_match(matching_countries)
+            if not sector:
+                continue
+
+            rows.append({
+                "company_number": company_number,
+                "company_name": company_name,
+                "sector": sector,
+                "time_added_to_table": now_uk_str(),
+                "pull_order": pull_counter,
+            })
+            pull_counter += 1
+
+        if len(items) < page_size:
             break
+        start_index += page_size
 
-        data = resp.json()
-        items = data.get("items", []) or []
-        if not items:
-            break
+    if not rows:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
 
-        officers.extend(items)
-
-        if len(items) < items_per_page:
-            break
-
-        start_index += items_per_page
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    return officers
+    df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
+    return (
+        df.sort_values("pull_order", ascending=False, kind="stable")
+        .drop_duplicates(subset=["company_number"], keep="first")
+        .reset_index(drop=True)
+    )
 
 
-def find_companies_with_director_country(
-    companies: List[Dict[str, Any]],
-    selected_country: str,
-    api_key: str,
-    max_companies_to_scan: int,
-) -> List[Dict[str, Any]]:
-    """
-    For each company in the list, fetch officers and keep companies that have
-    at least one officer with country_of_residence matching the selected country.
-    """
-    results: List[Dict[str, Any]] = []
-    scanned = 0
-
-    for company in companies:
-        if scanned >= max_companies_to_scan:
-            break
-
-        company_number = company.get("company_number")
-        if not company_number:
-            continue
-
-        officers = fetch_company_officers(company_number, api_key=api_key)
-        matching_officers = [
-            o for o in officers if officer_matches_country(o, selected_country)
-        ]
-
-        if matching_officers:
-            incorporation_date = company.get("date_of_creation")
-            inc_date_parsed = parse_iso_date(incorporation_date)
-            inc_date_str = (
-                inc_date_parsed.isoformat() if inc_date_parsed else incorporation_date
-            )
-
-            results.append(
-                {
-                    "company_number": company_number,
-                    "company_name": company.get("company_name"),
-                    "incorporation_date": inc_date_str,
-                    "director_country_of_residence": selected_country,
-                    "matching_officer_count": len(matching_officers),
-                    "example_officer_name": matching_officers[0]
-                    .get("name", "")
-                    .title()
-                    if matching_officers[0].get("name")
-                    else "",
-                }
-            )
-
-        scanned += 1
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    return results
+def get_store_paths(run_date: str) -> Tuple[Path, Path]:
+    snapshot_path = DATA_DIR / f"companies_{run_date}.csv"
+    seen_path = DATA_DIR / f"seen_{run_date}.csv"
+    return snapshot_path, seen_path
 
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
+def lead_file_path(person: str, run_date: str) -> Path:
+    return LEADS_DIR / f"{person.strip().lower()}_leads_{run_date}.csv"
+
+
+@st.cache_data(show_spinner=False)
+def load_results_csv(path_str: str, mtime: float) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists():
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+    return pd.read_csv(path, dtype={c: "string" for c in RESULT_COLUMNS}).fillna("")
+
+
+@st.cache_data(show_spinner=False)
+def load_leads_csv(path_str: str, mtime: float) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists():
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+    return pd.read_csv(path, dtype={c: "string" for c in LEAD_COLUMNS}).fillna("")
+
+
+def load_results(path: Path) -> pd.DataFrame:
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    return load_results_csv(str(path), mtime)
+
+
+def load_leads(person: str, run_date: str) -> pd.DataFrame:
+    path = lead_file_path(person, run_date)
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    return load_leads_csv(str(path), mtime)
+
+
+def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.DataFrame:
+    if current_df.empty:
+        return current_df.copy()
+    if seen_df.empty or "company_number" not in seen_df.columns:
+        return current_df.copy()
+    unseen = current_df[~current_df["company_number"].isin(seen_df["company_number"].astype(str))].copy()
+    return unseen.reset_index(drop=True)
+
+
+def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -> None:
+    current_df.to_csv(snapshot_path, index=False)
+    current_df.to_csv(seen_path, index=False)
+
+
+def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_leads: pd.DataFrame) -> bool:
+    path = lead_file_path(person, run_date)
+    company_number = str(row.get("company_number", "")).strip()
+    if not company_number:
+        return False
+
+    if not existing_leads.empty and company_number in set(existing_leads["company_number"].astype(str)):
+        return False
+
+    new_row = pd.DataFrame([{
+        "company_number": company_number,
+        "company_name": str(row.get("company_name", "")).strip(),
+        "sector": str(row.get("sector", "")).strip(),
+        "added_by": person,
+        "added_at": now_uk_str(),
+    }], columns=LEAD_COLUMNS)
+
+    if path.exists():
+        new_row.to_csv(path, mode="a", index=False, header=False)
+    else:
+        new_row.to_csv(path, index=False)
+    return True
+
+
+@st.cache_data(show_spinner=False)
+def convert_results_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df.empty:
+        return b""
+    export_df = df[["company_name", "sector", "time_added_to_table"]].rename(columns={
+        "company_name": "Company Name",
+        "sector": "Matched Director Country",
+        "time_added_to_table": "Time Added To Table",
+    })
+    return export_df.to_csv(index=False).encode("utf-8")
+
+
+@st.cache_data(show_spinner=False)
+def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df.empty:
+        return b""
+    export_df = df.rename(columns={
+        "company_number": "Company Number",
+        "company_name": "Company Name",
+        "sector": "Matched Director Country",
+        "added_by": "Added By",
+        "added_at": "Added At",
+    })
+    return export_df.to_csv(index=False).encode("utf-8")
+
+
+def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return (
+        df.sort_values(
+            ["time_added_to_table", "pull_order"],
+            ascending=[False, False],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
+    if existing_df.empty:
+        return fetched_df.copy()
+
+    existing_lookup = existing_df.set_index("company_number")[["time_added_to_table", "pull_order"]]
+    existing_numbers = set(existing_df["company_number"].astype(str))
+
+    new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+
+    known_rows = fetched_df[fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+    known_rows["time_added_to_table"] = known_rows["company_number"].map(
+        existing_lookup["time_added_to_table"]
+    )
+    known_rows["pull_order"] = known_rows["company_number"].map(
+        existing_lookup["pull_order"].astype(int)
+    )
+
+    merged = pd.concat([new_rows, known_rows], ignore_index=True)
+    return merged.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+
+
+def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
+    st.subheader(f"Quick add to {person}'s leads")
+    if df.empty:
+        st.info("No companies available to add.")
+        return
+
+    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty else set()
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        company_number = str(row.get("company_number", "")).strip()
+        already_added = company_number in existing_numbers
+        c1, c2, c3, c4 = st.columns([5, 1.6, 2, 0.9])
+        c1.write(f"**{row['company_name']}**")
+        c2.write(str(row["sector"]))
+        c3.write(str(row["time_added_to_table"]))
+        if already_added:
+            c4.caption("Added")
+        else:
+            if c4.button("Add", key=f"add_{person}_{company_number}_{idx}"):
+                added = add_company_to_leads(person, run_date, row, existing_leads)
+                if added:
+                    st.rerun()
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="Companies House: directors by country",
-        layout="wide",
-    )
+    st.title("Companies Incorporated Today")
+    st.caption("Filtered by director countries of residence.")
 
-    st.title("Companies House: director country-of-residence filter")
-
-    st.markdown(
-        """
-This app queries the UK Companies House Public Data API to find companies
-incorporated within a date range that have at least one director whose
-**country of residence** matches a selected country.
-
-It uses the Companies House advanced search endpoint and the company officers
-endpoint, which expose `incorporated_from` / `incorporated_to` filters and
-`country_of_residence` respectively.
-        """
-    )
-
-    api_keys = load_api_keys()
+    api_keys = get_api_keys()
     if not api_keys:
-        st.error(
-            "No Companies House API keys configured. "
-            "Set them via Streamlit secrets (.streamlit/secrets.toml) or environment "
-            "variables COMPANIES_HOUSE_API_KEY_1..3."
-        )
+        st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
         st.stop()
 
-    with st.sidebar:
-        st.header("Search settings")
+    run_date = today_uk_str()
+    snapshot_path, seen_path = get_store_paths(run_date)
 
-        start_date = st.date_input(
-            "Incorporated from",
-            value=date(2024, 1, 1),
-        )
-        end_date = st.date_input(
-            "Incorporated to",
-            value=date.today(),
-        )
+    st.sidebar.header("Controls")
+    selected_user = st.sidebar.selectbox("Working as", TEAM_MEMBERS, index=0)
+    refresh = st.sidebar.button("Refresh now", type="primary")
 
-        if end_date < start_date:
-            st.error("End date must be on or after start date.")
-            st.stop()
-
-        selected_country = st.selectbox(
-            "Director country of residence",
-            ALLOWED_COUNTRIES,
-            index=ALLOWED_COUNTRIES.index("Germany")
-            if "Germany" in ALLOWED_COUNTRIES
-            else 0,
-        )
-
-        max_results = st.number_input(
-            "Maximum companies to fetch from advanced search",
-            min_value=100,
-            max_value=10000,
-            value=DEFAULT_MAX_RESULTS,
-            step=100,
-            help=(
-                "Upper bound on total companies fetched from advanced search. "
-                "Companies House advanced search is limited to 10,000 results per query."
-            ),
-        )
-
-        max_companies_to_scan = st.number_input(
-            "Maximum companies to scan for officers",
-            min_value=10,
-            max_value=int(max_results),
-            value=min(DEFAULT_MAX_RESULTS, int(max_results)),
-            step=10,
-            help="Upper bound on how many companies we'll inspect for matching officers.",
-        )
-
-        page_size = st.slider(
-            "Advanced search page size (size)",
-            min_value=20,
-            max_value=5000,
-            value=DEFAULT_PAGE_SIZE,
-            step=20,
-            help=(
-                "Number of companies per API call from the advanced search endpoint. "
-                "Valid range is typically 1–5000."
-            ),
-        )
-
-        advanced_options = st.expander("Advanced options", expanded=False)
-        with advanced_options:
-            st.write(
-                "Companies House applies rate limits of 600 requests per 5 minutes per "
-                "REST API key. This app adds small delays between requests and caps the "
-                "number of companies to help stay within those limits."
-            )
-
-        run_search = st.button("Run search")
-
-    st.markdown("---")
-
-    if not run_search:
-        st.info("Configure parameters in the sidebar and click **Run search**.")
-        return
-
-    # Each search run uses a selected (or rotated) API key.
-    active_api_key = get_next_api_key(api_keys)
-
-    incorporated_from_str = start_date.isoformat()
-    incorporated_to_str = end_date.isoformat()
-
-    with st.spinner("Fetching companies from Companies House (advanced search)..."):
-        try:
-            companies = search_companies_advanced(
-                incorporated_from=incorporated_from_str,
-                incorporated_to=incorporated_to_str,
-                max_results=int(max_results),
-                page_size=int(page_size),
-                api_key=active_api_key,
-            )
-        except Exception as exc:
-            st.error(f"Error during advanced search: {exc}")
-            return
-
-    st.success(f"Fetched {len(companies)} companies from advanced search.")
-
-    if not companies:
-        st.warning("No companies found in that date range. Try widening the dates.")
-        return
-
-    with st.spinner(
-        f"Scanning up to {int(max_companies_to_scan)} companies for officers in {selected_country}..."
-    ):
-        try:
-            results = find_companies_with_director_country(
-                companies=companies,
-                selected_country=selected_country,
-                api_key=active_api_key,
-                max_companies_to_scan=int(max_companies_to_scan),
-            )
-        except Exception as exc:
-            st.error(f"Error while fetching officers: {exc}")
-            return
-
-    st.subheader("Matching companies")
-
-    if not results:
-        st.warning(
-            f"No companies in the fetched set had officers with country_of_residence "
-            f"matching {selected_country}."
-        )
-        return
-
-    st.write(
-        f"Found **{len(results)}** companies with at least one officer whose "
-        f"country of residence matches **{selected_country}**."
+    st.sidebar.caption(
+        "Countries: France, Germany, Spain, Norway, Italy, Sweden, Netherlands, Belgium, "
+        "Finland, Denmark, Poland, Portugal, USA, India, Hong Kong"
     )
 
-    st.dataframe(results, use_container_width=True)
+    if refresh or not snapshot_path.exists():
+        fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
+        existing_df = load_results(snapshot_path)
+        current_df = merge_preserving_timestamps(fetched_df, existing_df)
+        seen_df = load_results(seen_path)
+        new_df = identify_new_rows(current_df, seen_df)
+        save_state(current_df, snapshot_path, seen_path)
+        st.session_state["latest_df"] = current_df
+        st.session_state["sorted_df"] = get_sorted_current_df(current_df)
+        st.session_state["new_df"] = new_df
+        st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    else:
+        current_df = load_results(snapshot_path)
+        st.session_state.setdefault("latest_df", current_df)
+        st.session_state.setdefault("sorted_df", get_sorted_current_df(current_df))
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=RESULT_COLUMNS))
+        st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
-    st.caption(
-        "Data sourced from the Companies House Public Data API. "
-        "Remember that `country_of_residence` is a free-text field and may not always "
-        "standardise country names perfectly."
-    )
+    current_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    leads_df = load_leads(selected_user, run_date)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total pulled today", int(len(current_df)))
+    c2.metric(f"{selected_user}'s leads today", int(len(leads_df)))
+    c3.metric("Quick add rows", QUICK_ADD_DEFAULT)
+
+    st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
+
+    newest_df = sorted_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True) if not sorted_df.empty else sorted_df
+    render_quick_add(newest_df, selected_user, run_date, leads_df)
+
+    with st.expander(f"{selected_user}'s leads for today", expanded=False):
+        if leads_df.empty:
+            st.info(f"No leads saved yet for {selected_user}.")
+        else:
+            leads_display = leads_df.rename(columns={
+                "company_number": "Company Number",
+                "company_name": "Company Name",
+                "sector": "Matched Director Country",
+                "added_by": "Added By",
+                "added_at": "Added At",
+            })
+            st.dataframe(leads_display, use_container_width=True, hide_index=True)
+            st.download_button(
+                label=f"Download {selected_user}'s leads CSV",
+                data=convert_leads_csv_bytes(leads_df),
+                file_name=f"{selected_user.lower()}_leads_{run_date}.csv",
+                mime="text/csv",
+                key=f"download_{selected_user.lower()}_leads",
+            )
+
+    with st.expander("Today's results CSV", expanded=False):
+        if not current_df.empty:
+            st.download_button(
+                label="Download today's results as CSV",
+                data=convert_results_csv_bytes(current_df),
+                file_name=f"companies_incorporated_{run_date}.csv",
+                mime="text/csv",
+                key="download_results_csv",
+            )
+        else:
+            st.info("No results available yet.")
+
+    with st.expander("Full table", expanded=False):
+        if current_df.empty:
+            st.info("No companies to show yet.")
+        else:
+            preview_df = sorted_df[["company_name", "sector", "time_added_to_table"]].rename(columns={
+                "company_name": "Company Name",
+                "sector": "Matched Director Country",
+                "time_added_to_table": "Time Added To Table",
+            })
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
