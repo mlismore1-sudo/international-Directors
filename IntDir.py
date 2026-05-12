@@ -168,7 +168,7 @@ def fetch_with_rotation(
 
 def fetch_company_officers(company_number: str, api_keys: List[str]) -> List[dict]:
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
-    params = {"items_per_page": "100"}
+    params = {"items_per_page": "35"}
     response = fetch_with_rotation(url, params, api_keys)
     payload = response.json()
     return payload.get("items", []) or []
@@ -367,7 +367,6 @@ def convert_results_csv_bytes(df: pd.DataFrame) -> bytes:
             "time_added_to_table": "Time Added To Table",
         }
     )
-
     return export_df.to_csv(index=False).encode("utf-8")
 
 
@@ -385,7 +384,6 @@ def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
             "added_at": "Added At",
         }
     )
-
     return export_df.to_csv(index=False).encode("utf-8")
 
 
@@ -508,11 +506,16 @@ def main() -> None:
     snapshot_path, seen_path = get_store_paths(incorporated_from, incorporated_to)
 
     if refresh or not snapshot_path.exists():
-        fetched_df = fetch_companies_for_date_range(
-            api_keys,
-            incorporated_from,
-            incorporated_to,
-        )
+        try:
+            fetched_df = fetch_companies_for_date_range(
+                api_keys,
+                incorporated_from,
+                incorporated_to,
+            )
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
         existing_df = load_results(snapshot_path)
         current_df = merge_preserving_timestamps(fetched_df, existing_df)
         seen_df = load_results(seen_path)
@@ -552,6 +555,7 @@ def main() -> None:
         if not sorted_df.empty
         else sorted_df
     )
+
     render_quick_add(
         newest_df,
         selected_user,
