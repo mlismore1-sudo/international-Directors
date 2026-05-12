@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
+st.set_page_config(page_title="Companies Incorporated by Director Country", layout="wide")
 
 TARGET_DIRECTOR_COUNTRIES = {
     "france",
@@ -29,12 +29,32 @@ TARGET_DIRECTOR_COUNTRIES = {
     "hong kong",
 }
 
+COUNTRY_DISPLAY_ORDER = [
+    ("France", {"france"}),
+    ("Germany", {"germany"}),
+    ("Spain", {"spain"}),
+    ("Norway", {"norway"}),
+    ("Italy", {"italy"}),
+    ("Sweden", {"sweden"}),
+    ("Netherlands", {"netherlands"}),
+    ("Belgium", {"belgium"}),
+    ("Finland", {"finland"}),
+    ("Denmark", {"denmark"}),
+    ("Poland", {"poland"}),
+    ("Portugal", {"portugal"}),
+    ("USA", {"usa", "united states", "united states of america"}),
+    ("India", {"india"}),
+    ("Hong Kong", {"hong kong"}),
+]
+
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LEADS_DIR = DATA_DIR / "leads"
 LEADS_DIR.mkdir(exist_ok=True)
+
 TEAM_MEMBERS = ["Brad", "James"]
 QUICK_ADD_DEFAULT = 15
+
 RESULT_COLUMNS = [
     "company_number",
     "company_name",
@@ -45,8 +65,12 @@ RESULT_COLUMNS = [
 LEAD_COLUMNS = ["company_number", "company_name", "sector", "added_by", "added_at"]
 
 
+def today_uk_date() -> date:
+    return datetime.now().astimezone().date()
+
+
 def today_uk_str() -> str:
-    return datetime.now().astimezone().date().isoformat()
+    return today_uk_date().isoformat()
 
 
 def now_uk_str() -> str:
@@ -58,10 +82,12 @@ def get_api_keys() -> List[str]:
     list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
     if list_style_keys:
         keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
+
     for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
         value = st.secrets.get(key_name, "")
         if value:
             keys.append(str(value).strip())
+
     deduped_keys = []
     seen = set()
     for key in keys:
@@ -75,7 +101,7 @@ def auth_header(api_key: str) -> Dict[str, str]:
     token = base64.b64encode(f"{api_key}:".encode()).decode()
     return {
         "Authorization": f"Basic {token}",
-        "User-Agent": "streamlit-companies-house-today-app",
+        "User-Agent": "streamlit-companies-house-country-filter-app",
     }
 
 
@@ -84,25 +110,8 @@ def normalize_country(value: str) -> str:
 
 
 def classify_country_match(officer_countries: Set[str]) -> Optional[str]:
-    ordered_labels = [
-        ("France", {"france"}),
-        ("Germany", {"germany"}),
-        ("Spain", {"spain"}),
-        ("Norway", {"norway"}),
-        ("Italy", {"italy"}),
-        ("Sweden", {"sweden"}),
-        ("Netherlands", {"netherlands"}),
-        ("Belgium", {"belgium"}),
-        ("Finland", {"finland"}),
-        ("Denmark", {"denmark"}),
-        ("Poland", {"poland"}),
-        ("Portugal", {"portugal"}),
-        ("USA", {"usa", "united states", "united states of america"}),
-        ("India", {"india"}),
-        ("Hong Kong", {"hong kong"}),
-    ]
-    for label, country_values in ordered_labels:
-        if officer_countries & country_values:
+    for label, aliases in COUNTRY_DISPLAY_ORDER:
+        if officer_countries & aliases:
             return label
     return None
 
@@ -112,9 +121,15 @@ def get_session() -> requests.Session:
     return requests.Session()
 
 
-def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], timeout: int = 30) -> requests.Response:
+def fetch_with_rotation(
+    url: str,
+    params: Dict[str, str],
+    api_keys: List[str],
+    timeout: int = 30,
+) -> requests.Response:
     session = get_session()
     last_response = None
+
     for api_key in api_keys:
         response = session.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
         if response.status_code in (401, 429):
@@ -122,6 +137,7 @@ def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], t
             continue
         response.raise_for_status()
         return response
+
     if last_response is not None:
         last_response.raise_for_status()
     raise RuntimeError("No valid Companies House API keys were available.")
@@ -148,8 +164,7 @@ def get_matching_director_countries(company_number: str, api_keys: List[str]) ->
         if officer_role not in {"director", "llp-member"}:
             continue
 
-        resigned_on = str(officer.get("resigned_on", "")).strip()
-        if resigned_on:
+        if str(officer.get("resigned_on", "")).strip():
             continue
 
         country = normalize_country(officer.get("country_of_residence", ""))
@@ -159,7 +174,7 @@ def get_matching_director_countries(company_number: str, api_keys: List[str]) ->
     return matches
 
 
-def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd.DataFrame:
+def fetch_companies_for_date_range(api_keys: List[str], incorporated_from: str, incorporated_to: str) -> pd.DataFrame:
     url = "https://api.company-information.service.gov.uk/advanced-search/companies"
     start_index = 0
     page_size = 100
@@ -168,8 +183,8 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
 
     while True:
         params = {
-            "incorporated_from": run_date,
-            "incorporated_to": run_date,
+            "incorporated_from": incorporated_from,
+            "incorporated_to": incorporated_to,
             "size": str(page_size),
             "start_index": str(start_index),
         }
@@ -212,14 +227,16 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
     )
 
 
-def get_store_paths(run_date: str) -> Tuple[Path, Path]:
-    snapshot_path = DATA_DIR / f"companies_{run_date}.csv"
-    seen_path = DATA_DIR / f"seen_{run_date}.csv"
+def get_store_paths(incorporated_from: str, incorporated_to: str) -> Tuple[Path, Path]:
+    suffix = f"{incorporated_from}_to_{incorporated_to}"
+    snapshot_path = DATA_DIR / f"companies_{suffix}.csv"
+    seen_path = DATA_DIR / f"seen_{suffix}.csv"
     return snapshot_path, seen_path
 
 
-def lead_file_path(person: str, run_date: str) -> Path:
-    return LEADS_DIR / f"{person.strip().lower()}_leads_{run_date}.csv"
+def lead_file_path(person: str, incorporated_from: str, incorporated_to: str) -> Path:
+    suffix = f"{incorporated_from}_to_{incorporated_to}"
+    return LEADS_DIR / f"{person.strip().lower()}_leads_{suffix}.csv"
 
 
 @st.cache_data(show_spinner=False)
@@ -243,8 +260,8 @@ def load_results(path: Path) -> pd.DataFrame:
     return load_results_csv(str(path), mtime)
 
 
-def load_leads(person: str, run_date: str) -> pd.DataFrame:
-    path = lead_file_path(person, run_date)
+def load_leads(person: str, incorporated_from: str, incorporated_to: str) -> pd.DataFrame:
+    path = lead_file_path(person, incorporated_from, incorporated_to)
     mtime = path.stat().st_mtime if path.exists() else 0.0
     return load_leads_csv(str(path), mtime)
 
@@ -263,8 +280,14 @@ def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -
     current_df.to_csv(seen_path, index=False)
 
 
-def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_leads: pd.DataFrame) -> bool:
-    path = lead_file_path(person, run_date)
+def add_company_to_leads(
+    person: str,
+    incorporated_from: str,
+    incorporated_to: str,
+    row: pd.Series,
+    existing_leads: pd.DataFrame,
+) -> bool:
+    path = lead_file_path(person, incorporated_from, incorporated_to)
     company_number = str(row.get("company_number", "")).strip()
     if not company_number:
         return False
@@ -336,18 +359,20 @@ def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFr
     new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
 
     known_rows = fetched_df[fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
-    known_rows["time_added_to_table"] = known_rows["company_number"].map(
-        existing_lookup["time_added_to_table"]
-    )
-    known_rows["pull_order"] = known_rows["company_number"].map(
-        existing_lookup["pull_order"].astype(int)
-    )
+    known_rows["time_added_to_table"] = known_rows["company_number"].map(existing_lookup["time_added_to_table"])
+    known_rows["pull_order"] = known_rows["company_number"].map(existing_lookup["pull_order"].astype(int))
 
     merged = pd.concat([new_rows, known_rows], ignore_index=True)
     return merged.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
 
 
-def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
+def render_quick_add(
+    df: pd.DataFrame,
+    person: str,
+    incorporated_from: str,
+    incorporated_to: str,
+    existing_leads: pd.DataFrame,
+) -> None:
     st.subheader(f"Quick add to {person}'s leads")
     if df.empty:
         st.info("No companies available to add.")
@@ -366,34 +391,58 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
             c4.caption("Added")
         else:
             if c4.button("Add", key=f"add_{person}_{company_number}_{idx}"):
-                added = add_company_to_leads(person, run_date, row, existing_leads)
+                added = add_company_to_leads(
+                    person,
+                    incorporated_from,
+                    incorporated_to,
+                    row,
+                    existing_leads,
+                )
                 if added:
                     st.rerun()
 
 
 def main() -> None:
-    st.title("Companies Incorporated Today")
-    st.caption("Filtered by director countries of residence.")
+    st.title("Companies Incorporated by Director Country")
+    st.caption("Filter by incorporation date and target director countries of residence.")
 
     api_keys = get_api_keys()
     if not api_keys:
         st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
         st.stop()
 
-    run_date = today_uk_str()
-    snapshot_path, seen_path = get_store_paths(run_date)
-
     st.sidebar.header("Controls")
     selected_user = st.sidebar.selectbox("Working as", TEAM_MEMBERS, index=0)
-    refresh = st.sidebar.button("Refresh now", type="primary")
 
+    default_date = today_uk_date()
+    start_date = st.sidebar.date_input(
+        "Incorporated from",
+        value=default_date,
+        format="DD/MM/YYYY",
+    )
+    end_date = st.sidebar.date_input(
+        "Incorporated to",
+        value=default_date,
+        format="DD/MM/YYYY",
+    )
+
+    if start_date > end_date:
+        st.sidebar.error("'Incorporated from' must be on or before 'Incorporated to'.")
+        st.stop()
+
+    incorporated_from = start_date.isoformat()
+    incorporated_to = end_date.isoformat()
+
+    refresh = st.sidebar.button("Refresh now", type="primary")
     st.sidebar.caption(
         "Countries: France, Germany, Spain, Norway, Italy, Sweden, Netherlands, Belgium, "
         "Finland, Denmark, Poland, Portugal, USA, India, Hong Kong"
     )
 
+    snapshot_path, seen_path = get_store_paths(incorporated_from, incorporated_to)
+
     if refresh or not snapshot_path.exists():
-        fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
+        fetched_df = fetch_companies_for_date_range(api_keys, incorporated_from, incorporated_to)
         existing_df = load_results(snapshot_path)
         current_df = merge_preserving_timestamps(fetched_df, existing_df)
         seen_df = load_results(seen_path)
@@ -412,19 +461,22 @@ def main() -> None:
 
     current_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
     sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
-    leads_df = load_leads(selected_user, run_date)
+    leads_df = load_leads(selected_user, incorporated_from, incorporated_to)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total pulled today", int(len(current_df)))
-    c2.metric(f"{selected_user}'s leads today", int(len(leads_df)))
+    c1.metric("Total matched", int(len(current_df)))
+    c2.metric(f"{selected_user}'s leads", int(len(leads_df)))
     c3.metric("Quick add rows", QUICK_ADD_DEFAULT)
 
-    st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
+    st.caption(
+        f"Working as {selected_user} | Incorporation range: {incorporated_from} to {incorporated_to} | "
+        f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}"
+    )
 
     newest_df = sorted_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True) if not sorted_df.empty else sorted_df
-    render_quick_add(newest_df, selected_user, run_date, leads_df)
+    render_quick_add(newest_df, selected_user, incorporated_from, incorporated_to, leads_df)
 
-    with st.expander(f"{selected_user}'s leads for today", expanded=False):
+    with st.expander(f"{selected_user}'s leads", expanded=False):
         if leads_df.empty:
             st.info(f"No leads saved yet for {selected_user}.")
         else:
@@ -439,17 +491,17 @@ def main() -> None:
             st.download_button(
                 label=f"Download {selected_user}'s leads CSV",
                 data=convert_leads_csv_bytes(leads_df),
-                file_name=f"{selected_user.lower()}_leads_{run_date}.csv",
+                file_name=f"{selected_user.lower()}_leads_{incorporated_from}_to_{incorporated_to}.csv",
                 mime="text/csv",
                 key=f"download_{selected_user.lower()}_leads",
             )
 
-    with st.expander("Today's results CSV", expanded=False):
+    with st.expander("Results CSV", expanded=False):
         if not current_df.empty:
             st.download_button(
-                label="Download today's results as CSV",
+                label="Download results as CSV",
                 data=convert_results_csv_bytes(current_df),
-                file_name=f"companies_incorporated_{run_date}.csv",
+                file_name=f"companies_incorporated_{incorporated_from}_to_{incorporated_to}.csv",
                 mime="text/csv",
                 key="download_results_csv",
             )
