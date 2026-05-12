@@ -1,4 +1,5 @@
 import base64
+import json
 import time
 from collections import deque
 from datetime import date, datetime
@@ -9,7 +10,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="International Directors Queue", layout="wide")
+st.set_page_config(page_title="International Directors Universe", layout="wide")
 
 TARGET_DIRECTOR_COUNTRIES = {
     "france",
@@ -52,10 +53,11 @@ COUNTRY_DISPLAY_ORDER = [
 TEAM_MEMBERS = ["Brad", "James"]
 
 DISCOVERY_PAGE_SIZE = 25
-DISCOVERY_PAGES_PER_RUN = 2
+FRONT_SCAN_PAGES_DEFAULT = 2
+BACKFILL_PAGES_PER_RUN_DEFAULT = 1
 PROCESS_BATCH_SIZE_DEFAULT = 15
-REQUEST_PAUSE_SECONDS = 0.12
 
+REQUEST_PAUSE_SECONDS = 0.12
 RATE_LIMIT_PER_KEY = 599
 RATE_LIMIT_WINDOW_SECONDS = 300
 
@@ -65,11 +67,17 @@ DATA_DIR.mkdir(exist_ok=True)
 LEADS_DIR = DATA_DIR / "leads"
 LEADS_DIR.mkdir(exist_ok=True)
 
-QUEUE_DIR = DATA_DIR / "queues"
-QUEUE_DIR.mkdir(exist_ok=True)
+UNIVERSE_DIR = DATA_DIR / "universe"
+UNIVERSE_DIR.mkdir(exist_ok=True)
 
-DISCOVERY_DIR = DATA_DIR / "discovery"
-DISCOVERY_DIR.mkdir(exist_ok=True)
+STATUS_DIR = DATA_DIR / "status"
+STATUS_DIR.mkdir(exist_ok=True)
+
+STATE_DIR = DATA_DIR / "state"
+STATE_DIR.mkdir(exist_ok=True)
+
+MATCHED_DIR = DATA_DIR / "matched"
+MATCHED_DIR.mkdir(exist_ok=True)
 
 RESULT_COLUMNS = [
     "company_number",
@@ -87,23 +95,23 @@ LEAD_COLUMNS = [
     "added_at",
 ]
 
-QUEUE_COLUMNS = [
+UNIVERSE_COLUMNS = [
     "company_number",
     "company_name",
-    "discovered_at",
-    "last_seen_at",
+    "first_discovered_at",
+    "last_discovered_at",
+    "latest_source",
+]
+
+STATUS_COLUMNS = [
+    "company_number",
+    "company_name",
     "status",
     "matched_country",
     "processed_at",
     "error_message",
-    "priority_rank",
-]
-
-DISCOVERY_COLUMNS = [
-    "company_number",
-    "company_name",
-    "discovered_at",
-    "page_number",
+    "first_discovered_at",
+    "last_discovered_at",
 ]
 
 _key_request_log: Dict[str, Deque[float]] = {}
@@ -121,6 +129,26 @@ def date_suffix(incorporated_from: str, incorporated_to: str) -> str:
     return f"{incorporated_from}_to_{incorporated_to}"
 
 
+def universe_file_path(incorporated_from: str, incorporated_to: str) -> Path:
+    return UNIVERSE_DIR / f"universe_{date_suffix(incorporated_from, incorporated_to)}.csv"
+
+
+def status_file_path(incorporated_from: str, incorporated_to: str) -> Path:
+    return STATUS_DIR / f"status_{date_suffix(incorporated_from, incorporated_to)}.csv"
+
+
+def matched_file_path(incorporated_from: str, incorporated_to: str) -> Path:
+    return MATCHED_DIR / f"matched_{date_suffix(incorporated_from, incorporated_to)}.csv"
+
+
+def state_file_path(incorporated_from: str, incorporated_to: str) -> Path:
+    return STATE_DIR / f"state_{date_suffix(incorporated_from, incorporated_to)}.json"
+
+
+def lead_file_path(person: str, incorporated_from: str, incorporated_to: str) -> Path:
+    return LEADS_DIR / f"{person.strip().lower()}_leads_{date_suffix(incorporated_from, incorporated_to)}.csv"
+
+
 def get_api_keys() -> List[str]:
     keys: List[str] = []
 
@@ -135,7 +163,6 @@ def get_api_keys() -> List[str]:
 
     deduped_keys = []
     seen = set()
-
     for key in keys:
         if key and key not in seen:
             deduped_keys.append(key)
@@ -148,7 +175,7 @@ def auth_header(api_key: str) -> Dict[str, str]:
     token = base64.b64encode(f"{api_key}:".encode()).decode()
     return {
         "Authorization": f"Basic {token}",
-        "User-Agent": "streamlit-international-directors-queue-app",
+        "User-Agent": "streamlit-international-directors-universe-app",
     }
 
 
@@ -256,22 +283,6 @@ def fetch_with_rotation(
     raise RuntimeError("No valid Companies House API keys were available.")
 
 
-def queue_file_path(incorporated_from: str, incorporated_to: str) -> Path:
-    return QUEUE_DIR / f"queue_{date_suffix(incorporated_from, incorporated_to)}.csv"
-
-
-def discovery_file_path(incorporated_from: str, incorporated_to: str) -> Path:
-    return DISCOVERY_DIR / f"discovery_{date_suffix(incorporated_from, incorporated_to)}.csv"
-
-
-def snapshot_path(incorporated_from: str, incorporated_to: str) -> Path:
-    return DATA_DIR / f"matched_{date_suffix(incorporated_from, incorporated_to)}.csv"
-
-
-def lead_file_path(person: str, incorporated_from: str, incorporated_to: str) -> Path:
-    return LEADS_DIR / f"{person.strip().lower()}_leads_{date_suffix(incorporated_from, incorporated_to)}.csv"
-
-
 @st.cache_data(show_spinner=False)
 def load_csv_cached(path_str: str, mtime: float, columns: Tuple[str, ...]) -> pd.DataFrame:
     path = Path(path_str)
@@ -294,149 +305,232 @@ def save_csv(df: pd.DataFrame, path: Path, columns: List[str]) -> None:
     out.to_csv(path, index=False)
 
 
-def fetch_discovery_pages(
+def load_state(incorporated_from: str, incorporated_to: str) -> Dict[str, int]:
+    path = state_file_path(incorporated_from, incorporated_to)
+    if not path.exists():
+        return {"next_backfill_start_index": FRONT_SCAN_PAGES_DEFAULT * DISCOVERY_PAGE_SIZE}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {"next_backfill_start_index": FRONT_SCAN_PAGES_DEFAULT * DISCOVERY_PAGE_SIZE}
+
+
+def save_state_json(incorporated_from: str, incorporated_to: str, state: Dict[str, int]) -> None:
+    path = state_file_path(incorporated_from, incorporated_to)
+    path.write_text(json.dumps(state))
+
+
+def fetch_advanced_search_page(
     api_keys: List[str],
     incorporated_from: str,
     incorporated_to: str,
-    pages_to_fetch: int,
+    start_index: int,
+    size: int,
+    source_label: str,
 ) -> pd.DataFrame:
     url = "https://api.company-information.service.gov.uk/advanced-search/companies"
+    params = {
+        "incorporated_from": incorporated_from,
+        "incorporated_to": incorporated_to,
+        "size": str(size),
+        "start_index": str(start_index),
+    }
+
+    response = fetch_with_rotation(url, params, api_keys)
+    payload = response.json()
+    items = payload.get("items", []) or []
+
+    discovered_at = now_uk_str()
     rows = []
 
-    for page_number in range(pages_to_fetch):
-        start_index = page_number * DISCOVERY_PAGE_SIZE
-        params = {
-            "incorporated_from": incorporated_from,
-            "incorporated_to": incorporated_to,
-            "size": str(DISCOVERY_PAGE_SIZE),
-            "start_index": str(start_index),
-        }
-
-        response = fetch_with_rotation(url, params, api_keys)
-        payload = response.json()
-        items = payload.get("items", []) or []
-
-        discovered_at = now_uk_str()
-
-        for item in items:
-            company_number = str(item.get("company_number", "")).strip()
-            company_name = str(item.get("company_name", "")).strip()
-            if not company_number:
-                continue
-
-            rows.append(
-                {
-                    "company_number": company_number,
-                    "company_name": company_name,
-                    "discovered_at": discovered_at,
-                    "page_number": str(page_number),
-                }
-            )
-
-        if len(items) < DISCOVERY_PAGE_SIZE:
-            break
-
-    if not rows:
-        return pd.DataFrame(columns=DISCOVERY_COLUMNS)
-
-    return pd.DataFrame(rows, columns=DISCOVERY_COLUMNS)
-
-
-def merge_discovery(discovery_df: pd.DataFrame, newly_found_df: pd.DataFrame) -> pd.DataFrame:
-    if discovery_df.empty:
-        merged = newly_found_df.copy()
-    else:
-        merged = pd.concat([newly_found_df, discovery_df], ignore_index=True)
-
-    merged = (
-        merged.sort_values(["discovered_at"], ascending=[False], kind="stable")
-        .drop_duplicates(subset=["company_number"], keep="first")
-        .reset_index(drop=True)
-    )
-    return merged
-
-
-def merge_queue(queue_df: pd.DataFrame, discovery_df: pd.DataFrame) -> pd.DataFrame:
-    if queue_df.empty:
-        queue_df = pd.DataFrame(columns=QUEUE_COLUMNS)
-
-    queue_df = queue_df.copy()
-
-    for col in QUEUE_COLUMNS:
-        if col not in queue_df.columns:
-            queue_df[col] = ""
-
-    existing_status = {}
-    if not queue_df.empty:
-        existing_status = (
-            queue_df.drop_duplicates(subset=["company_number"], keep="first")
-            .set_index("company_number")["status"]
-            .astype(str)
-            .to_dict()
-        )
-
-    discovery_rows = []
-    for rank, (_, row) in enumerate(discovery_df.iterrows()):
-        company_number = str(row.get("company_number", "")).strip()
+    for item in items:
+        company_number = str(item.get("company_number", "")).strip()
+        company_name = str(item.get("company_name", "")).strip()
         if not company_number:
             continue
 
-        already_status = existing_status.get(company_number, "")
-
-        if already_status in {"matched", "not_matched", "error"}:
-            continue
-
-        if already_status == "pending":
-            continue
-
-        discovery_rows.append(
+        rows.append(
             {
                 "company_number": company_number,
-                "company_name": str(row.get("company_name", "")).strip(),
-                "discovered_at": str(row.get("discovered_at", "")).strip(),
-                "last_seen_at": str(row.get("discovered_at", "")).strip(),
-                "status": "pending",
-                "matched_country": "",
-                "processed_at": "",
-                "error_message": "",
-                "priority_rank": str(rank),
+                "company_name": company_name,
+                "first_discovered_at": discovered_at,
+                "last_discovered_at": discovered_at,
+                "latest_source": source_label,
             }
         )
 
-    if discovery_rows:
-        queue_df = pd.concat(
-            [queue_df, pd.DataFrame(discovery_rows, columns=QUEUE_COLUMNS)],
-            ignore_index=True,
-        )
+    if not rows:
+        return pd.DataFrame(columns=UNIVERSE_COLUMNS)
 
-    discovery_lookup = (
-        discovery_df.drop_duplicates(subset=["company_number"], keep="first")
-        .set_index("company_number")[["company_name", "discovered_at"]]
+    return pd.DataFrame(rows, columns=UNIVERSE_COLUMNS)
+
+
+def discover_companies(
+    api_keys: List[str],
+    incorporated_from: str,
+    incorporated_to: str,
+    front_scan_pages: int,
+    backfill_pages_per_run: int,
+) -> Tuple[pd.DataFrame, Dict[str, int], int]:
+    universe_df = load_generic_csv(universe_file_path(incorporated_from, incorporated_to), UNIVERSE_COLUMNS)
+    state = load_state(incorporated_from, incorporated_to)
+
+    fetched_frames = []
+    total_new_added = 0
+
+    for page in range(front_scan_pages):
+        start_index = page * DISCOVERY_PAGE_SIZE
+        page_df = fetch_advanced_search_page(
+            api_keys,
+            incorporated_from,
+            incorporated_to,
+            start_index,
+            DISCOVERY_PAGE_SIZE,
+            f"front_{page}",
+        )
+        fetched_frames.append(page_df)
+
+    next_backfill_start_index = int(state.get("next_backfill_start_index", front_scan_pages * DISCOVERY_PAGE_SIZE))
+
+    for _ in range(backfill_pages_per_run):
+        page_df = fetch_advanced_search_page(
+            api_keys,
+            incorporated_from,
+            incorporated_to,
+            next_backfill_start_index,
+            DISCOVERY_PAGE_SIZE,
+            f"backfill_{next_backfill_start_index}",
+        )
+        fetched_frames.append(page_df)
+
+        if page_df.empty:
+            next_backfill_start_index = front_scan_pages * DISCOVERY_PAGE_SIZE
+            break
+        else:
+            next_backfill_start_index += DISCOVERY_PAGE_SIZE
+
+    state["next_backfill_start_index"] = next_backfill_start_index
+
+    if fetched_frames:
+        new_fetch_df = pd.concat(fetched_frames, ignore_index=True)
+    else:
+        new_fetch_df = pd.DataFrame(columns=UNIVERSE_COLUMNS)
+
+    if universe_df.empty:
+        merged = new_fetch_df.copy()
+        total_new_added = len(merged)
+    else:
+        existing_numbers = set(universe_df["company_number"].astype(str))
+        total_new_added = int((~new_fetch_df["company_number"].astype(str).isin(existing_numbers)).sum()) if not new_fetch_df.empty else 0
+
+        combined = pd.concat([new_fetch_df, universe_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+
+        if not new_fetch_df.empty:
+            latest_lookup = new_fetch_df.drop_duplicates(subset=["company_number"], keep="first").set_index("company_number")
+            existing_lookup = universe_df.drop_duplicates(subset=["company_number"], keep="first").set_index("company_number")
+
+            rows = []
+            for company_number in combined["company_number"].astype(str):
+                if company_number in latest_lookup.index and company_number in existing_lookup.index:
+                    latest_row = latest_lookup.loc[company_number]
+                    existing_row = existing_lookup.loc[company_number]
+                    rows.append(
+                        {
+                            "company_number": company_number,
+                            "company_name": str(latest_row.get("company_name", existing_row.get("company_name", ""))),
+                            "first_discovered_at": str(existing_row.get("first_discovered_at", latest_row.get("first_discovered_at", ""))),
+                            "last_discovered_at": str(latest_row.get("last_discovered_at", existing_row.get("last_discovered_at", ""))),
+                            "latest_source": str(latest_row.get("latest_source", existing_row.get("latest_source", ""))),
+                        }
+                    )
+                elif company_number in latest_lookup.index:
+                    latest_row = latest_lookup.loc[company_number]
+                    rows.append(
+                        {
+                            "company_number": company_number,
+                            "company_name": str(latest_row.get("company_name", "")),
+                            "first_discovered_at": str(latest_row.get("first_discovered_at", "")),
+                            "last_discovered_at": str(latest_row.get("last_discovered_at", "")),
+                            "latest_source": str(latest_row.get("latest_source", "")),
+                        }
+                    )
+                else:
+                    existing_row = existing_lookup.loc[company_number]
+                    rows.append(
+                        {
+                            "company_number": company_number,
+                            "company_name": str(existing_row.get("company_name", "")),
+                            "first_discovered_at": str(existing_row.get("first_discovered_at", "")),
+                            "last_discovered_at": str(existing_row.get("last_discovered_at", "")),
+                            "latest_source": str(existing_row.get("latest_source", "")),
+                        }
+                    )
+
+            merged = pd.DataFrame(rows, columns=UNIVERSE_COLUMNS)
+        else:
+            merged = universe_df.copy()
+
+    merged = merged.sort_values(["last_discovered_at"], ascending=[False], kind="stable").reset_index(drop=True)
+    save_csv(merged, universe_file_path(incorporated_from, incorporated_to), UNIVERSE_COLUMNS)
+    save_state_json(incorporated_from, incorporated_to, state)
+
+    return merged, state, total_new_added
+
+
+def build_or_update_status(universe_df: pd.DataFrame, incorporated_from: str, incorporated_to: str) -> pd.DataFrame:
+    status_df = load_generic_csv(status_file_path(incorporated_from, incorporated_to), STATUS_COLUMNS)
+
+    if status_df.empty:
+        status_df = pd.DataFrame(columns=STATUS_COLUMNS)
+
+    for col in STATUS_COLUMNS:
+        if col not in status_df.columns:
+            status_df[col] = ""
+
+    status_lookup = (
+        status_df.drop_duplicates(subset=["company_number"], keep="first").set_index("company_number")
+        if not status_df.empty else pd.DataFrame()
     )
 
-    for idx, row in queue_df.iterrows():
-        company_number = str(row.get("company_number", "")).strip()
-        if company_number in discovery_lookup.index:
-            queue_df.at[idx, "last_seen_at"] = str(discovery_lookup.at[company_number, "discovered_at"])
-            if not str(row.get("company_name", "")).strip():
-                queue_df.at[idx, "company_name"] = str(discovery_lookup.at[company_number, "company_name"])
+    rows = []
+    for _, uni in universe_df.iterrows():
+        company_number = str(uni.get("company_number", "")).strip()
+        if not company_number:
+            continue
 
-    queue_df = (
-        queue_df.sort_values(["discovered_at"], ascending=[False], kind="stable")
-        .drop_duplicates(subset=["company_number"], keep="first")
-        .reset_index(drop=True)
-    )
+        if not status_df.empty and company_number in status_lookup.index:
+            old = status_lookup.loc[company_number]
+            rows.append(
+                {
+                    "company_number": company_number,
+                    "company_name": str(uni.get("company_name", old.get("company_name", ""))),
+                    "status": str(old.get("status", "pending")) or "pending",
+                    "matched_country": str(old.get("matched_country", "")),
+                    "processed_at": str(old.get("processed_at", "")),
+                    "error_message": str(old.get("error_message", "")),
+                    "first_discovered_at": str(old.get("first_discovered_at", uni.get("first_discovered_at", ""))),
+                    "last_discovered_at": str(uni.get("last_discovered_at", old.get("last_discovered_at", ""))),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "company_number": company_number,
+                    "company_name": str(uni.get("company_name", "")).strip(),
+                    "status": "pending",
+                    "matched_country": "",
+                    "processed_at": "",
+                    "error_message": "",
+                    "first_discovered_at": str(uni.get("first_discovered_at", "")),
+                    "last_discovered_at": str(uni.get("last_discovered_at", "")),
+                }
+            )
 
-    discovery_rank_map = {
-        str(row["company_number"]): idx
-        for idx, (_, row) in enumerate(
-            discovery_df.drop_duplicates(subset=["company_number"], keep="first").iterrows()
-        )
-    }
-
-    queue_df["priority_rank"] = queue_df["company_number"].map(discovery_rank_map).fillna(999999).astype(int).astype(str)
-
-    return queue_df
+    updated_status_df = pd.DataFrame(rows, columns=STATUS_COLUMNS)
+    updated_status_df = updated_status_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+    save_csv(updated_status_df, status_file_path(incorporated_from, incorporated_to), STATUS_COLUMNS)
+    return updated_status_df
 
 
 def fetch_company_officers(company_number: str, api_keys: List[str]) -> List[dict]:
@@ -466,140 +560,98 @@ def get_matching_director_countries(company_number: str, api_keys: List[str]) ->
     return matches
 
 
-def process_queue_batch(
-    queue_df: pd.DataFrame,
+def process_unscreened_batch(
+    status_df: pd.DataFrame,
     api_keys: List[str],
     batch_size: int,
+    incorporated_from: str,
+    incorporated_to: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
-    if queue_df.empty:
-        return queue_df, pd.DataFrame(columns=RESULT_COLUMNS), 0
+    if status_df.empty:
+        return status_df, pd.DataFrame(columns=RESULT_COLUMNS), 0
 
-    queue_df = queue_df.copy()
-    matched_rows = []
-    processed_count = 0
+    status_df = status_df.copy()
 
-    already_screened_statuses = {"matched", "not_matched", "error"}
-
-    pending_df = queue_df[
-        ~queue_df["status"].astype(str).isin(already_screened_statuses)
-    ].copy()
-
-    pending_df = pending_df[pending_df["status"].astype(str) == "pending"].copy()
-
+    pending_df = status_df[status_df["status"].astype(str) == "pending"].copy()
     if pending_df.empty:
-        return queue_df, pd.DataFrame(columns=RESULT_COLUMNS), 0
-
-    pending_df["priority_rank_num"] = pd.to_numeric(
-        pending_df["priority_rank"], errors="coerce"
-    ).fillna(999999)
+        save_csv(status_df, status_file_path(incorporated_from, incorporated_to), STATUS_COLUMNS)
+        matched_existing = load_generic_csv(matched_file_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
+        return status_df, matched_existing, 0
 
     pending_df = pending_df.sort_values(
-        ["priority_rank_num", "discovered_at"],
-        ascending=[True, False],
+        ["last_discovered_at", "first_discovered_at"],
+        ascending=[False, False],
         kind="stable",
     ).head(batch_size)
 
+    matched_existing = load_generic_csv(matched_file_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
+    new_matched_rows = []
+    processed_count = 0
+
     for pull_order, (idx, row) in enumerate(pending_df.iterrows()):
         company_number = str(row.get("company_number", "")).strip()
-        if not company_number:
-            continue
+        company_name = str(row.get("company_name", "")).strip()
 
         try:
             matching_countries = get_matching_director_countries(company_number, api_keys)
             matched_country = classify_country_match(matching_countries)
 
             if matched_country:
-                queue_df.at[idx, "status"] = "matched"
-                queue_df.at[idx, "matched_country"] = matched_country
-                matched_rows.append(
-                    {
-                        "company_number": company_number,
-                        "company_name": str(row.get("company_name", "")).strip(),
-                        "sector": matched_country,
-                        "time_added_to_table": now_uk_str(),
-                        "pull_order": pull_order,
-                    }
-                )
-            else:
-                queue_df.at[idx, "status"] = "not_matched"
-                queue_df.at[idx, "matched_country"] = ""
+                status_df.at[idx, "status"] = "matched"
+                status_df.at[idx, "matched_country"] = matched_country
 
-            queue_df.at[idx, "processed_at"] = now_uk_str()
-            queue_df.at[idx, "error_message"] = ""
+                if matched_existing.empty or company_number not in set(matched_existing["company_number"].astype(str)):
+                    new_matched_rows.append(
+                        {
+                            "company_number": company_number,
+                            "company_name": company_name,
+                            "sector": matched_country,
+                            "time_added_to_table": now_uk_str(),
+                            "pull_order": pull_order,
+                        }
+                    )
+            else:
+                status_df.at[idx, "status"] = "not_matched"
+                status_df.at[idx, "matched_country"] = ""
+
+            status_df.at[idx, "processed_at"] = now_uk_str()
+            status_df.at[idx, "error_message"] = ""
             processed_count += 1
 
         except RuntimeError as e:
-            queue_df.at[idx, "status"] = "pending"
-            queue_df.at[idx, "error_message"] = str(e)
+            status_df.at[idx, "status"] = "pending"
+            status_df.at[idx, "error_message"] = str(e)
             if "rate limit" in str(e).lower() or "403" in str(e).lower() or "429" in str(e).lower():
                 break
 
         except Exception as e:
-            queue_df.at[idx, "status"] = "error"
-            queue_df.at[idx, "processed_at"] = now_uk_str()
-            queue_df.at[idx, "error_message"] = str(e)
+            status_df.at[idx, "status"] = "error"
+            status_df.at[idx, "processed_at"] = now_uk_str()
+            status_df.at[idx, "error_message"] = str(e)
             processed_count += 1
 
-    matched_df = (
-        pd.DataFrame(matched_rows, columns=RESULT_COLUMNS)
-        if matched_rows
-        else pd.DataFrame(columns=RESULT_COLUMNS)
-    )
+    new_matched_df = pd.DataFrame(new_matched_rows, columns=RESULT_COLUMNS) if new_matched_rows else pd.DataFrame(columns=RESULT_COLUMNS)
 
-    queue_df = queue_df.drop(columns=["priority_rank_num"], errors="ignore")
-    return queue_df, matched_df, processed_count
+    if matched_existing.empty:
+        matched_df = new_matched_df.copy()
+    else:
+        matched_df = pd.concat([new_matched_df, matched_existing], ignore_index=True)
 
+    if not matched_df.empty:
+        matched_df = (
+            matched_df.sort_values(["time_added_to_table", "pull_order"], ascending=[False, False], kind="stable")
+            .drop_duplicates(subset=["company_number"], keep="first")
+            .reset_index(drop=True)
+        )
 
-def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
-    if fetched_df.empty:
-        return existing_df.copy() if not existing_df.empty else pd.DataFrame(columns=RESULT_COLUMNS)
+    save_csv(status_df, status_file_path(incorporated_from, incorporated_to), STATUS_COLUMNS)
+    save_csv(matched_df, matched_file_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
 
-    if existing_df.empty:
-        return fetched_df.copy()
-
-    existing_lookup = existing_df.set_index("company_number")[["time_added_to_table", "pull_order"]]
-    existing_numbers = set(existing_df["company_number"].astype(str))
-
-    new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
-    known_rows = fetched_df[fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
-
-    known_rows["time_added_to_table"] = known_rows["company_number"].map(existing_lookup["time_added_to_table"])
-    known_rows["pull_order"] = known_rows["company_number"].map(existing_lookup["pull_order"].astype(int))
-
-    merged = pd.concat([new_rows, known_rows, existing_df], ignore_index=True)
-    return (
-        merged.sort_values(["time_added_to_table", "pull_order"], ascending=[False, False], kind="stable")
-        .drop_duplicates(subset=["company_number"], keep="first")
-        .reset_index(drop=True)
-    )
-
-
-def load_results(path: Path) -> pd.DataFrame:
-    return load_generic_csv(path, RESULT_COLUMNS)
+    return status_df, matched_df, processed_count
 
 
 def load_leads(person: str, incorporated_from: str, incorporated_to: str) -> pd.DataFrame:
     return load_generic_csv(lead_file_path(person, incorporated_from, incorporated_to), LEAD_COLUMNS)
-
-
-def load_queue(incorporated_from: str, incorporated_to: str) -> pd.DataFrame:
-    return load_generic_csv(queue_file_path(incorporated_from, incorporated_to), QUEUE_COLUMNS)
-
-
-def load_discovery(incorporated_from: str, incorporated_to: str) -> pd.DataFrame:
-    return load_generic_csv(discovery_file_path(incorporated_from, incorporated_to), DISCOVERY_COLUMNS)
-
-
-def save_state(
-    matched_df: pd.DataFrame,
-    queue_df: pd.DataFrame,
-    discovery_df: pd.DataFrame,
-    incorporated_from: str,
-    incorporated_to: str,
-) -> None:
-    save_csv(matched_df, snapshot_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
-    save_csv(queue_df, queue_file_path(incorporated_from, incorporated_to), QUEUE_COLUMNS)
-    save_csv(discovery_df, discovery_file_path(incorporated_from, incorporated_to), DISCOVERY_COLUMNS)
 
 
 def add_company_to_leads(
@@ -669,19 +721,6 @@ def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
     return export_df.to_csv(index=False).encode("utf-8")
 
 
-def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return (
-        df.sort_values(
-            ["time_added_to_table", "pull_order"],
-            ascending=[False, False],
-            kind="stable",
-        )
-        .reset_index(drop=True)
-    )
-
-
 def render_quick_add(
     df: pd.DataFrame,
     person: str,
@@ -695,11 +734,7 @@ def render_quick_add(
         st.info("No matched companies available to add.")
         return
 
-    existing_numbers = (
-        set(existing_leads["company_number"].astype(str))
-        if not existing_leads.empty
-        else set()
-    )
+    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty else set()
 
     for idx, (_, row) in enumerate(df.iterrows()):
         company_number = str(row.get("company_number", "")).strip()
@@ -726,8 +761,8 @@ def render_quick_add(
 
 
 def main() -> None:
-    st.title("International Directors Queue")
-    st.caption("Discovery queue + processing queue with already screened names excluded from re-checking.")
+    st.title("International Directors Universe")
+    st.caption("Local universe + screening-status model with newest discoveries prioritised and no re-screening.")
 
     api_keys = get_api_keys()
     if not api_keys:
@@ -740,20 +775,6 @@ def main() -> None:
     default_date = today_uk_date()
     start_date = st.sidebar.date_input("Incorporated from", value=default_date)
     end_date = st.sidebar.date_input("Incorporated to", value=default_date)
-    pages_per_run = st.sidebar.number_input(
-        "Discovery pages per refresh",
-        min_value=1,
-        max_value=5,
-        value=DISCOVERY_PAGES_PER_RUN,
-        step=1,
-    )
-    process_batch_size = st.sidebar.number_input(
-        "Processing batch size",
-        min_value=1,
-        max_value=50,
-        value=PROCESS_BATCH_SIZE_DEFAULT,
-        step=1,
-    )
 
     if start_date > end_date:
         st.sidebar.error("'Incorporated from' must be on or before 'Incorporated to'.")
@@ -762,42 +783,62 @@ def main() -> None:
     incorporated_from = start_date.isoformat()
     incorporated_to = end_date.isoformat()
 
-    st.sidebar.caption(
-        "Countries: France, Germany, Spain, Norway, Italy, Sweden, Netherlands, Belgium, "
-        "Finland, Denmark, Poland, Portugal, USA, India, Hong Kong"
+    front_scan_pages = st.sidebar.number_input(
+        "Front scan pages per refresh",
+        min_value=1,
+        max_value=5,
+        value=FRONT_SCAN_PAGES_DEFAULT,
+        step=1,
+    )
+    backfill_pages_per_run = st.sidebar.number_input(
+        "Backfill pages per refresh",
+        min_value=0,
+        max_value=5,
+        value=BACKFILL_PAGES_PER_RUN_DEFAULT,
+        step=1,
+    )
+    process_batch_size = st.sidebar.number_input(
+        "Officer checks per refresh",
+        min_value=1,
+        max_value=50,
+        value=PROCESS_BATCH_SIZE_DEFAULT,
+        step=1,
     )
 
-    refresh = st.sidebar.button("Run discovery + processing", type="primary")
+    refresh = st.sidebar.button("Run refresh", type="primary")
 
-    matched_path = snapshot_path(incorporated_from, incorporated_to)
-    matched_df_existing = load_results(matched_path)
-    queue_df = load_queue(incorporated_from, incorporated_to)
-    discovery_df = load_discovery(incorporated_from, incorporated_to)
+    st.sidebar.caption(
+        "Discovery uses advanced-search for the selected date, then screening only processes names still marked pending."
+    )
+
+    universe_df = load_generic_csv(universe_file_path(incorporated_from, incorporated_to), UNIVERSE_COLUMNS)
+    status_df = load_generic_csv(status_file_path(incorporated_from, incorporated_to), STATUS_COLUMNS)
+    matched_df = load_generic_csv(matched_file_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
+    state = load_state(incorporated_from, incorporated_to)
 
     if refresh:
         try:
-            new_discovery_df = fetch_discovery_pages(
+            universe_df, state, new_discovered_count = discover_companies(
                 api_keys,
                 incorporated_from,
                 incorporated_to,
-                int(pages_per_run),
+                int(front_scan_pages),
+                int(backfill_pages_per_run),
             )
-            discovery_df = merge_discovery(discovery_df, new_discovery_df)
-            queue_df = merge_queue(queue_df, discovery_df)
-
-            queue_df, new_matched_df, processed_count = process_queue_batch(
-                queue_df,
+            status_df = build_or_update_status(universe_df, incorporated_from, incorporated_to)
+            status_df, matched_df, processed_count = process_unscreened_batch(
+                status_df,
                 api_keys,
                 int(process_batch_size),
+                incorporated_from,
+                incorporated_to,
             )
 
-            matched_df = merge_preserving_timestamps(new_matched_df, matched_df_existing)
-            save_state(matched_df, queue_df, discovery_df, incorporated_from, incorporated_to)
-
-            st.session_state["latest_df"] = matched_df
-            st.session_state["sorted_df"] = get_sorted_current_df(matched_df)
-            st.session_state["queue_df"] = queue_df
-            st.session_state["discovery_df"] = discovery_df
+            st.session_state["universe_df"] = universe_df
+            st.session_state["status_df"] = status_df
+            st.session_state["matched_df"] = matched_df
+            st.session_state["state_json"] = state
+            st.session_state["new_discovered_count"] = new_discovered_count
             st.session_state["processed_count"] = processed_count
             st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -805,53 +846,81 @@ def main() -> None:
             st.error(str(e))
             st.stop()
     else:
-        matched_df = matched_df_existing
-        st.session_state.setdefault("latest_df", matched_df)
-        st.session_state.setdefault("sorted_df", get_sorted_current_df(matched_df))
-        st.session_state.setdefault("queue_df", queue_df)
-        st.session_state.setdefault("discovery_df", discovery_df)
+        st.session_state.setdefault("universe_df", universe_df)
+        st.session_state.setdefault("status_df", status_df)
+        st.session_state.setdefault("matched_df", matched_df)
+        st.session_state.setdefault("state_json", state)
+        st.session_state.setdefault("new_discovered_count", 0)
         st.session_state.setdefault("processed_count", 0)
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
-    matched_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
-    sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
-    queue_df = st.session_state.get("queue_df", pd.DataFrame(columns=QUEUE_COLUMNS))
-    discovery_df = st.session_state.get("discovery_df", pd.DataFrame(columns=DISCOVERY_COLUMNS))
+    universe_df = st.session_state.get("universe_df", pd.DataFrame(columns=UNIVERSE_COLUMNS))
+    status_df = st.session_state.get("status_df", pd.DataFrame(columns=STATUS_COLUMNS))
+    matched_df = st.session_state.get("matched_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    state = st.session_state.get("state_json", {"next_backfill_start_index": front_scan_pages * DISCOVERY_PAGE_SIZE})
+
     leads_df = load_leads(selected_user, incorporated_from, incorporated_to)
 
-    pending_count = int((queue_df["status"] == "pending").sum()) if not queue_df.empty else 0
-    matched_count = int((queue_df["status"] == "matched").sum()) if not queue_df.empty else 0
-    not_matched_count = int((queue_df["status"] == "not_matched").sum()) if not queue_df.empty else 0
-    error_count = int((queue_df["status"] == "error").sum()) if not queue_df.empty else 0
+    pending_count = int((status_df["status"] == "pending").sum()) if not status_df.empty else 0
+    matched_count = int((status_df["status"] == "matched").sum()) if not status_df.empty else 0
+    not_matched_count = int((status_df["status"] == "not_matched").sum()) if not status_df.empty else 0
+    error_count = int((status_df["status"] == "error").sum()) if not status_df.empty else 0
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Discovered", int(len(discovery_df)))
-    c2.metric("Pending queue", pending_count)
-    c3.metric("Matched", matched_count)
-    c4.metric("Not matched", not_matched_count)
-    c5.metric("Errors", error_count)
+    c1.metric("Universe size", int(len(universe_df)))
+    c2.metric("New discovered this run", int(st.session_state.get("new_discovered_count", 0)))
+    c3.metric("Pending", pending_count)
+    c4.metric("Matched", matched_count)
+    c5.metric("Processed this run", int(st.session_state.get("processed_count", 0)))
 
     st.caption(
         f"Working as {selected_user} | Range: {incorporated_from} to {incorporated_to} | "
         f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}"
     )
 
-    st.caption(f"Processed this run: {int(st.session_state.get('processed_count', 0))}")
+    st.caption(
+        f"Next backfill start_index: {int(state.get('next_backfill_start_index', int(front_scan_pages) * DISCOVERY_PAGE_SIZE))}"
+    )
 
-    newest_df = sorted_df.head(15).reset_index(drop=True) if not sorted_df.empty else sorted_df
-    render_quick_add(newest_df, selected_user, incorporated_from, incorporated_to, leads_df)
+    newest_matched_df = matched_df.head(15).reset_index(drop=True) if not matched_df.empty else matched_df
+    render_quick_add(newest_matched_df, selected_user, incorporated_from, incorporated_to, leads_df)
 
-    with st.expander("Queue status", expanded=True):
-        if queue_df.empty:
-            st.info("No queue items yet.")
+    with st.expander("Universe", expanded=False):
+        if universe_df.empty:
+            st.info("No discovered companies yet.")
         else:
-            queue_preview = queue_df.copy()
-            queue_preview = queue_preview.sort_values(
-                ["status", "priority_rank", "discovered_at"],
-                ascending=[True, True, False],
+            st.dataframe(universe_df, use_container_width=True, hide_index=True)
+
+    with st.expander("Screening status", expanded=True):
+        if status_df.empty:
+            st.info("No status rows yet.")
+        else:
+            status_preview = status_df.sort_values(
+                ["status", "last_discovered_at"],
+                ascending=[True, False],
                 kind="stable",
             )
-            st.dataframe(queue_preview, use_container_width=True, hide_index=True)
+            st.dataframe(status_preview, use_container_width=True, hide_index=True)
+
+    with st.expander("Matched companies", expanded=False):
+        if matched_df.empty:
+            st.info("No matched companies yet.")
+        else:
+            preview_df = matched_df.rename(
+                columns={
+                    "company_name": "Company Name",
+                    "sector": "Matched Director Country",
+                    "time_added_to_table": "Time Added To Table",
+                }
+            )
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                label="Download matched results CSV",
+                data=convert_results_csv_bytes(matched_df),
+                file_name=f"matched_companies_{date_suffix(incorporated_from, incorporated_to)}.csv",
+                mime="text/csv",
+                key="download_results_csv",
+            )
 
     with st.expander(f"{selected_user}'s leads", expanded=False):
         if leads_df.empty:
@@ -875,39 +944,14 @@ def main() -> None:
                 key=f"download_{selected_user.lower()}_leads",
             )
 
-    with st.expander("Matched results CSV", expanded=False):
-        if not matched_df.empty:
-            st.download_button(
-                label="Download matched results as CSV",
-                data=convert_results_csv_bytes(matched_df),
-                file_name=f"matched_companies_{date_suffix(incorporated_from, incorporated_to)}.csv",
-                mime="text/csv",
-                key="download_results_csv",
-            )
-        else:
-            st.info("No matched results available yet.")
-
-    with st.expander("Matched table", expanded=False):
-        if matched_df.empty:
-            st.info("No matched companies to show yet.")
-        else:
-            preview_df = sorted_df[["company_name", "sector", "time_added_to_table"]].rename(
-                columns={
-                    "company_name": "Company Name",
-                    "sector": "Matched Director Country",
-                    "time_added_to_table": "Time Added To Table",
-                }
-            )
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
-
     with st.expander("Notes", expanded=False):
         st.write(
-            "Already screened companies are retained in the queue with status values like matched, "
-            "not_matched, or error, and are not sent for officer lookup again."
+            "This version keeps a persistent universe of discovered companies for the chosen date range, "
+            "a separate persistent screening-status table, and only officer-checks rows still marked pending."
         )
         st.write(
-            "This prevents repeated screening of the same names, although full-day progress will improve further "
-            "once a deeper discovery backfill cursor is added."
+            "Discovery combines a front scan for newest companies and a backfill cursor for deeper pages, "
+            "so it can keep finding new names without repeatedly looping over only the first slice."
         )
 
 
