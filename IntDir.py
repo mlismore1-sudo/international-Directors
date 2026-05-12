@@ -1,7 +1,9 @@
 import base64
+import time
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import requests
@@ -72,6 +74,12 @@ LEAD_COLUMNS = [
     "added_at",
 ]
 
+RATE_LIMIT_PER_KEY = 599
+RATE_LIMIT_WINDOW_SECONDS = 300
+REQUEST_PAUSE_SECONDS = 0.15
+
+_key_request_log: Dict[str, Deque[float]] = {}
+
 
 def today_uk_date() -> date:
     return datetime.now().astimezone().date()
@@ -128,6 +136,34 @@ def get_session() -> requests.Session:
     return requests.Session()
 
 
+def _prune_key_log(api_key: str) -> None:
+    now = time.time()
+    if api_key not in _key_request_log:
+        _key_request_log[api_key] = deque()
+
+    while _key_request_log[api_key] and now - _key_request_log[api_key][0] >= RATE_LIMIT_WINDOW_SECONDS:
+        _key_request_log[api_key].popleft()
+
+
+def _can_use_key(api_key: str) -> bool:
+    _prune_key_log(api_key)
+    return len(_key_request_log[api_key]) < RATE_LIMIT_PER_KEY
+
+
+def _record_key_use(api_key: str) -> None:
+    _prune_key_log(api_key)
+    _key_request_log[api_key].append(time.time())
+
+
+def _seconds_until_key_available(api_key: str) -> int:
+    _prune_key_log(api_key)
+    if len(_key_request_log[api_key]) < RATE_LIMIT_PER_KEY:
+        return 0
+    oldest = _key_request_log[api_key][0]
+    remaining = int(RATE_LIMIT_WINDOW_SECONDS - (time.time() - oldest)) + 1
+    return max(1, remaining)
+
+
 def fetch_with_rotation(
     url: str,
     params: Dict[str, str],
@@ -135,9 +171,19 @@ def fetch_with_rotation(
     timeout: int = 30,
 ) -> requests.Response:
     session = get_session()
-    last_response = None
+    last_error_message = None
 
-    for api_key in api_keys:
+    available_keys = [key for key in api_keys if _can_use_key(key)]
+
+    if not available_keys:
+        wait_times = [_seconds_until_key_available(key) for key in api_keys]
+        min_wait = min(wait_times) if wait_times else RATE_LIMIT_WINDOW_SECONDS
+        raise RuntimeError(
+            f"All Companies House API keys are currently at the rate limit. "
+            f"Please wait about {min_wait} seconds and try again."
+        )
+
+    for api_key in available_keys:
         response = session.get(
             url,
             headers=auth_header(api_key),
@@ -145,8 +191,18 @@ def fetch_with_rotation(
             timeout=timeout,
         )
 
-        if response.status_code in (401, 429):
-            last_response = response
+        _record_key_use(api_key)
+        time.sleep(REQUEST_PAUSE_SECONDS)
+
+        if response.status_code == 429:
+            last_error_message = (
+                f"Companies House API key hit 429 rate limit for {url} "
+                f"with params={params}."
+            )
+            continue
+
+        if response.status_code == 401:
+            last_error_message = "A Companies House API key returned 401 Unauthorized."
             continue
 
         if not response.ok:
@@ -157,11 +213,10 @@ def fetch_with_rotation(
 
         return response
 
-    if last_response is not None:
-        raise RuntimeError(
-            f"Companies House API error {last_response.status_code} for {url} "
-            f"with params={params}. Response: {last_response.text[:1000]}"
-        )
+    if last_error_message:
+        wait_times = [_seconds_until_key_available(key) for key in api_keys]
+        min_wait = min(wait_times) if wait_times else RATE_LIMIT_WINDOW_SECONDS
+        raise RuntimeError(f"{last_error_message} Try again in about {min_wait} seconds.")
 
     raise RuntimeError("No valid Companies House API keys were available.")
 
@@ -204,7 +259,7 @@ def fetch_companies_for_date_range(
 ) -> pd.DataFrame:
     url = "https://api.company-information.service.gov.uk/advanced-search/companies"
     start_index = 0
-    page_size = 100
+    page_size = 25
     rows = []
     pull_counter = 0
 
