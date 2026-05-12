@@ -268,10 +268,6 @@ def snapshot_path(incorporated_from: str, incorporated_to: str) -> Path:
     return DATA_DIR / f"matched_{date_suffix(incorporated_from, incorporated_to)}.csv"
 
 
-def seen_path(incorporated_from: str, incorporated_to: str) -> Path:
-    return DATA_DIR / f"seen_{date_suffix(incorporated_from, incorporated_to)}.csv"
-
-
 def lead_file_path(person: str, incorporated_from: str, incorporated_to: str) -> Path:
     return LEADS_DIR / f"{person.strip().lower()}_leads_{date_suffix(incorporated_from, incorporated_to)}.csv"
 
@@ -366,15 +362,34 @@ def merge_queue(queue_df: pd.DataFrame, discovery_df: pd.DataFrame) -> pd.DataFr
 
     queue_df = queue_df.copy()
 
-    existing_numbers = set(queue_df["company_number"].astype(str)) if not queue_df.empty else set()
-    new_rows = []
+    for col in QUEUE_COLUMNS:
+        if col not in queue_df.columns:
+            queue_df[col] = ""
 
+    existing_status = {}
+    if not queue_df.empty:
+        existing_status = (
+            queue_df.drop_duplicates(subset=["company_number"], keep="first")
+            .set_index("company_number")["status"]
+            .astype(str)
+            .to_dict()
+        )
+
+    discovery_rows = []
     for rank, (_, row) in enumerate(discovery_df.iterrows()):
         company_number = str(row.get("company_number", "")).strip()
-        if not company_number or company_number in existing_numbers:
+        if not company_number:
             continue
 
-        new_rows.append(
+        already_status = existing_status.get(company_number, "")
+
+        if already_status in {"matched", "not_matched", "error"}:
+            continue
+
+        if already_status == "pending":
+            continue
+
+        discovery_rows.append(
             {
                 "company_number": company_number,
                 "company_name": str(row.get("company_name", "")).strip(),
@@ -388,30 +403,39 @@ def merge_queue(queue_df: pd.DataFrame, discovery_df: pd.DataFrame) -> pd.DataFr
             }
         )
 
-    if new_rows:
-        queue_df = pd.concat([pd.DataFrame(new_rows, columns=QUEUE_COLUMNS), queue_df], ignore_index=True)
+    if discovery_rows:
+        queue_df = pd.concat(
+            [queue_df, pd.DataFrame(discovery_rows, columns=QUEUE_COLUMNS)],
+            ignore_index=True,
+        )
 
-    discovery_lookup = discovery_df.set_index("company_number")[["company_name", "discovered_at"]]
-    queue_numbers = queue_df["company_number"].astype(str)
-
-    seen_now = queue_numbers.isin(discovery_lookup.index.astype(str))
-    queue_df.loc[seen_now, "last_seen_at"] = queue_df.loc[seen_now, "company_number"].map(
-        discovery_lookup["discovered_at"]
-    ).fillna(queue_df.loc[seen_now, "last_seen_at"])
-
-    queue_df.loc[seen_now, "company_name"] = queue_df.loc[seen_now, "company_number"].map(
-        discovery_lookup["company_name"]
-    ).fillna(queue_df.loc[seen_now, "company_name"])
-
-    queue_df["priority_rank"] = (
-        queue_df["company_number"]
-        .map({str(row["company_number"]): idx for idx, (_, row) in enumerate(discovery_df.iterrows())})
-        .fillna(999999)
-        .astype(int)
-        .astype(str)
+    discovery_lookup = (
+        discovery_df.drop_duplicates(subset=["company_number"], keep="first")
+        .set_index("company_number")[["company_name", "discovered_at"]]
     )
 
-    queue_df = queue_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+    for idx, row in queue_df.iterrows():
+        company_number = str(row.get("company_number", "")).strip()
+        if company_number in discovery_lookup.index:
+            queue_df.at[idx, "last_seen_at"] = str(discovery_lookup.at[company_number, "discovered_at"])
+            if not str(row.get("company_name", "")).strip():
+                queue_df.at[idx, "company_name"] = str(discovery_lookup.at[company_number, "company_name"])
+
+    queue_df = (
+        queue_df.sort_values(["discovered_at"], ascending=[False], kind="stable")
+        .drop_duplicates(subset=["company_number"], keep="first")
+        .reset_index(drop=True)
+    )
+
+    discovery_rank_map = {
+        str(row["company_number"]): idx
+        for idx, (_, row) in enumerate(
+            discovery_df.drop_duplicates(subset=["company_number"], keep="first").iterrows()
+        )
+    }
+
+    queue_df["priority_rank"] = queue_df["company_number"].map(discovery_rank_map).fillna(999999).astype(int).astype(str)
+
     return queue_df
 
 
@@ -454,11 +478,21 @@ def process_queue_batch(
     matched_rows = []
     processed_count = 0
 
-    pending_df = queue_df[queue_df["status"].astype(str) == "pending"].copy()
+    already_screened_statuses = {"matched", "not_matched", "error"}
+
+    pending_df = queue_df[
+        ~queue_df["status"].astype(str).isin(already_screened_statuses)
+    ].copy()
+
+    pending_df = pending_df[pending_df["status"].astype(str) == "pending"].copy()
+
     if pending_df.empty:
         return queue_df, pd.DataFrame(columns=RESULT_COLUMNS), 0
 
-    pending_df["priority_rank_num"] = pd.to_numeric(pending_df["priority_rank"], errors="coerce").fillna(999999)
+    pending_df["priority_rank_num"] = pd.to_numeric(
+        pending_df["priority_rank"], errors="coerce"
+    ).fillna(999999)
+
     pending_df = pending_df.sort_values(
         ["priority_rank_num", "discovered_at"],
         ascending=[True, False],
@@ -467,6 +501,8 @@ def process_queue_batch(
 
     for pull_order, (idx, row) in enumerate(pending_df.iterrows()):
         company_number = str(row.get("company_number", "")).strip()
+        if not company_number:
+            continue
 
         try:
             matching_countries = get_matching_director_countries(company_number, api_keys)
@@ -497,14 +533,21 @@ def process_queue_batch(
             queue_df.at[idx, "error_message"] = str(e)
             if "rate limit" in str(e).lower() or "403" in str(e).lower() or "429" in str(e).lower():
                 break
+
         except Exception as e:
             queue_df.at[idx, "status"] = "error"
             queue_df.at[idx, "processed_at"] = now_uk_str()
             queue_df.at[idx, "error_message"] = str(e)
             processed_count += 1
 
-    matched_df = pd.DataFrame(matched_rows, columns=RESULT_COLUMNS) if matched_rows else pd.DataFrame(columns=RESULT_COLUMNS)
-    return queue_df.drop(columns=["priority_rank_num"], errors="ignore"), matched_df, processed_count
+    matched_df = (
+        pd.DataFrame(matched_rows, columns=RESULT_COLUMNS)
+        if matched_rows
+        else pd.DataFrame(columns=RESULT_COLUMNS)
+    )
+
+    queue_df = queue_df.drop(columns=["priority_rank_num"], errors="ignore")
+    return queue_df, matched_df, processed_count
 
 
 def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
@@ -555,7 +598,6 @@ def save_state(
     incorporated_to: str,
 ) -> None:
     save_csv(matched_df, snapshot_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
-    save_csv(matched_df, seen_path(incorporated_from, incorporated_to), RESULT_COLUMNS)
     save_csv(queue_df, queue_file_path(incorporated_from, incorporated_to), QUEUE_COLUMNS)
     save_csv(discovery_df, discovery_file_path(incorporated_from, incorporated_to), DISCOVERY_COLUMNS)
 
@@ -685,7 +727,7 @@ def render_quick_add(
 
 def main() -> None:
     st.title("International Directors Queue")
-    st.caption("Discovery queue + processing queue with newest companies prioritised.")
+    st.caption("Discovery queue + processing queue with already screened names excluded from re-checking.")
 
     api_keys = get_api_keys()
     if not api_keys:
@@ -698,8 +740,20 @@ def main() -> None:
     default_date = today_uk_date()
     start_date = st.sidebar.date_input("Incorporated from", value=default_date)
     end_date = st.sidebar.date_input("Incorporated to", value=default_date)
-    pages_per_run = st.sidebar.number_input("Discovery pages per refresh", min_value=1, max_value=5, value=DISCOVERY_PAGES_PER_RUN, step=1)
-    process_batch_size = st.sidebar.number_input("Processing batch size", min_value=1, max_value=50, value=PROCESS_BATCH_SIZE_DEFAULT, step=1)
+    pages_per_run = st.sidebar.number_input(
+        "Discovery pages per refresh",
+        min_value=1,
+        max_value=5,
+        value=DISCOVERY_PAGES_PER_RUN,
+        step=1,
+    )
+    process_batch_size = st.sidebar.number_input(
+        "Processing batch size",
+        min_value=1,
+        max_value=50,
+        value=PROCESS_BATCH_SIZE_DEFAULT,
+        step=1,
+    )
 
     if start_date > end_date:
         st.sidebar.error("'Incorporated from' must be on or before 'Incorporated to'.")
@@ -768,17 +822,21 @@ def main() -> None:
     pending_count = int((queue_df["status"] == "pending").sum()) if not queue_df.empty else 0
     matched_count = int((queue_df["status"] == "matched").sum()) if not queue_df.empty else 0
     not_matched_count = int((queue_df["status"] == "not_matched").sum()) if not queue_df.empty else 0
+    error_count = int((queue_df["status"] == "error").sum()) if not queue_df.empty else 0
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Discovered", int(len(discovery_df)))
     c2.metric("Pending queue", pending_count)
     c3.metric("Matched", matched_count)
-    c4.metric("Processed this run", int(st.session_state.get("processed_count", 0)))
+    c4.metric("Not matched", not_matched_count)
+    c5.metric("Errors", error_count)
 
     st.caption(
         f"Working as {selected_user} | Range: {incorporated_from} to {incorporated_to} | "
         f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}"
     )
+
+    st.caption(f"Processed this run: {int(st.session_state.get('processed_count', 0))}")
 
     newest_df = sorted_df.head(15).reset_index(drop=True) if not sorted_df.empty else sorted_df
     render_quick_add(newest_df, selected_user, incorporated_from, incorporated_to, leads_df)
@@ -844,12 +902,12 @@ def main() -> None:
 
     with st.expander("Notes", expanded=False):
         st.write(
-            "Discovery adds the latest incorporated companies into a local queue. "
-            "Processing checks only a small batch each run, with newest discoveries first."
+            "Already screened companies are retained in the queue with status values like matched, "
+            "not_matched, or error, and are not sent for officer lookup again."
         )
         st.write(
-            "This reduces API intensity while still allowing the queue to work through all companies "
-            "for the selected date range over time."
+            "This prevents repeated screening of the same names, although full-day progress will improve further "
+            "once a deeper discovery backfill cursor is added."
         )
 
 
