@@ -57,15 +57,13 @@ COUNTRY_SYNONYMS = {
 # Companies House API configuration
 CH_API_BASE_URL = "https://api.company-information.service.gov.uk"
 
-# Safety controls
-DEFAULT_ITEMS_PER_PAGE = 50  # per advanced-search page
-DEFAULT_MAX_COMPANIES = 100  # hard cap to avoid huge runs and rate-limit issues
+# Safety controls for advanced search
+DEFAULT_PAGE_SIZE = 500      # 'size' param for advanced search (1–5000 typical)
+DEFAULT_MAX_RESULTS = 5000   # max total companies to fetch per query (API hard limit is 10000)
 REQUEST_SLEEP_SECONDS = 0.1  # small delay between requests as a courtesy
 
 # Toggle for rotating across multiple API keys.
-# IMPORTANT: Companies House explicitly warns against using multiple keys
-# for the same live application to circumvent rate limiting. Use rotation
-# only if you have a legitimate multi-key setup (e.g. separate test/prod apps).
+# Use rotation only if you have a legitimate multi-key setup (e.g. separate test/prod apps).
 ENABLE_KEY_ROTATION = False
 
 
@@ -82,8 +80,6 @@ def load_api_keys() -> List[str]:
         .streamlit/secrets.toml in your working directory:
         [ch_api]
         keys = ["KEY1", "KEY2", "KEY3"]
-
-    Also works with global secrets at ~/.streamlit/secrets.toml.[web:22]
 
     Fallback: environment variables:
         COMPANIES_HOUSE_API_KEY_1, COMPANIES_HOUSE_API_KEY_2, COMPANIES_HOUSE_API_KEY_3
@@ -142,7 +138,7 @@ def ch_get(
     """
     Make a GET request to the Companies House API with Basic auth.
 
-    The API key is sent as the username with a blank password.[web:35]
+    The API key is sent as the username with a blank password.
     """
     url = CH_API_BASE_URL + path
     resp = requests.get(url, auth=(api_key, ""), params=params, timeout=timeout)
@@ -190,8 +186,8 @@ def parse_iso_date(text: str) -> Optional[date]:
 def search_companies_advanced(
     incorporated_from: str,
     incorporated_to: str,
-    max_companies: int,
-    items_per_page: int,
+    max_results: int,
+    page_size: int,
     api_key: str,
 ) -> List[Dict[str, Any]]:
     """
@@ -199,16 +195,17 @@ def search_companies_advanced(
     incorporated within a date range.
 
     Uses the incorporated_from / incorporated_to filters on
-    /advanced-search/companies.[web:1]
+    /advanced-search/companies, and paginates using 'size' + 'start_index'.
     """
     companies: List[Dict[str, Any]] = []
     start_index = 0
 
-    while len(companies) < max_companies:
+    while len(companies) < max_results:
         params = {
             "incorporated_from": incorporated_from,
             "incorporated_to": incorporated_to,
-            "items_per_page": items_per_page,
+            # IMPORTANT: advanced search uses 'size', not 'items_per_page'.
+            "size": page_size,
             "start_index": start_index,
         }
 
@@ -221,18 +218,20 @@ def search_companies_advanced(
         data = resp.json()
         items = data.get("items", []) or []
         if not items:
+            # no more results
             break
 
         for item in items:
             companies.append(item)
-            if len(companies) >= max_companies:
+            if len(companies) >= max_results:
                 break
 
-        # Prepare for next page
-        if len(items) < items_per_page:
+        # If we received fewer than page_size items, we've hit the last page
+        if len(items) < page_size or len(companies) >= max_results:
             break
 
-        start_index += len(items)
+        # Move the window forward
+        start_index += page_size
         time.sleep(REQUEST_SLEEP_SECONDS)
 
     return companies
@@ -247,7 +246,7 @@ def fetch_company_officers(
     """
     Fetch the officers for a given company number using the
     /company/{company_number}/officers endpoint, which exposes
-    country_of_residence for each officer.[web:11]
+    country_of_residence for each officer.
     """
     officers: List[Dict[str, Any]] = []
     start_index = 0
@@ -275,7 +274,7 @@ def fetch_company_officers(
         if len(items) < items_per_page:
             break
 
-        start_index += len(items)
+        start_index += items_per_page
         time.sleep(REQUEST_SLEEP_SECONDS)
 
     return officers
@@ -356,7 +355,7 @@ incorporated within a date range that have at least one director whose
 
 It uses the Companies House advanced search endpoint and the company officers
 endpoint, which expose `incorporated_from` / `incorporated_to` filters and
-`country_of_residence` respectively.[web:1][web:11]
+`country_of_residence` respectively.
         """
     )
 
@@ -393,32 +392,37 @@ endpoint, which expose `incorporated_from` / `incorporated_to` filters and
             else 0,
         )
 
-        max_companies = st.number_input(
-            "Maximum companies to fetch (from advanced search)",
-            min_value=10,
-            max_value=500,
-            value=DEFAULT_MAX_COMPANIES,
-            step=10,
-            help="Upper bound on companies fetched from advanced search to help "
-            "stay within API rate limits.",
+        max_results = st.number_input(
+            "Maximum companies to fetch from advanced search",
+            min_value=100,
+            max_value=10000,
+            value=DEFAULT_MAX_RESULTS,
+            step=100,
+            help=(
+                "Upper bound on total companies fetched from advanced search. "
+                "Companies House advanced search is limited to 10,000 results per query."
+            ),
         )
 
         max_companies_to_scan = st.number_input(
             "Maximum companies to scan for officers",
             min_value=10,
-            max_value=int(max_companies),
-            value=min(DEFAULT_MAX_COMPANIES, int(max_companies)),
+            max_value=int(max_results),
+            value=min(DEFAULT_MAX_RESULTS, int(max_results)),
             step=10,
             help="Upper bound on how many companies we'll inspect for matching officers.",
         )
 
-        items_per_page = st.slider(
-            "Advanced search items per page",
-            min_value=10,
-            max_value=100,
-            value=DEFAULT_ITEMS_PER_PAGE,
-            step=10,
-            help="Number of companies per page from the advanced search endpoint.",
+        page_size = st.slider(
+            "Advanced search page size (size)",
+            min_value=20,
+            max_value=5000,
+            value=DEFAULT_PAGE_SIZE,
+            step=20,
+            help=(
+                "Number of companies per API call from the advanced search endpoint. "
+                "Valid range is typically 1–5000."
+            ),
         )
 
         advanced_options = st.expander("Advanced options", expanded=False)
@@ -426,7 +430,7 @@ endpoint, which expose `incorporated_from` / `incorporated_to` filters and
             st.write(
                 "Companies House applies rate limits of 600 requests per 5 minutes per "
                 "REST API key. This app adds small delays between requests and caps the "
-                "number of companies to help stay within those limits.[web:3][web:12]"
+                "number of companies to help stay within those limits."
             )
 
         run_search = st.button("Run search")
@@ -448,8 +452,8 @@ endpoint, which expose `incorporated_from` / `incorporated_to` filters and
             companies = search_companies_advanced(
                 incorporated_from=incorporated_from_str,
                 incorporated_to=incorporated_to_str,
-                max_companies=int(max_companies),
-                items_per_page=int(items_per_page),
+                max_results=int(max_results),
+                page_size=int(page_size),
                 api_key=active_api_key,
             )
         except Exception as exc:
@@ -495,7 +499,7 @@ endpoint, which expose `incorporated_from` / `incorporated_to` filters and
     st.caption(
         "Data sourced from the Companies House Public Data API. "
         "Remember that `country_of_residence` is a free-text field and may not always "
-        "standardise country names perfectly.[web:5][web:11]"
+        "standardise country names perfectly."
     )
 
 
