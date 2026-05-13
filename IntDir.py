@@ -1,7 +1,7 @@
 import base64
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -71,10 +71,6 @@ LEAD_COLUMNS = [
 
 def today_uk() -> date:
     return datetime.now().astimezone().date()
-
-
-def today_uk_str() -> str:
-    return today_uk().isoformat()
 
 
 def now_uk_str() -> str:
@@ -160,7 +156,17 @@ def fetch_company_officers(company_number: str, api_keys: List[str]) -> List[dic
             "items_per_page": str(items_per_page),
             "start_index": str(start_index),
         }
-        response = fetch_with_rotation(url, params, api_keys)
+
+        try:
+            response = fetch_with_rotation(url, params, api_keys)
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code in (404, 500):
+                return []
+            return []
+        except requests.exceptions.RequestException:
+            return []
+
         payload = response.json()
         items = payload.get("items", []) or []
         all_items.extend(items)
@@ -242,7 +248,15 @@ def fetch_companies_in_date_range(api_keys: List[str], from_date: str, to_date: 
             if not company_number:
                 continue
 
-            director_match_info = extract_target_resident_directors(company_number, api_keys)
+            try:
+                director_match_info = extract_target_resident_directors(company_number, api_keys)
+            except requests.exceptions.RequestException:
+                director_match_info = {
+                    "has_target_resident_director": "No",
+                    "matched_director_count": "0",
+                    "matched_director_names": "",
+                    "matched_countries_of_residence": "",
+                }
 
             rows.append({
                 "company_number": company_number,
@@ -415,14 +429,19 @@ def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    return (
-        df.sort_values(
-            ["has_target_resident_director", "matched_director_count", "time_added_to_table", "pull_order"],
+    sort_df = df.copy()
+    sort_df["matched_director_count_num"] = pd.to_numeric(sort_df["matched_director_count"], errors="coerce").fillna(0)
+
+    sorted_df = (
+        sort_df.sort_values(
+            ["has_target_resident_director", "matched_director_count_num", "time_added_to_table", "pull_order"],
             ascending=[False, False, False, False],
             kind="stable",
         )
+        .drop(columns=["matched_director_count_num"])
         .reset_index(drop=True)
     )
+    return sorted_df
 
 
 def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
