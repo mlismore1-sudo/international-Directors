@@ -13,7 +13,10 @@ TARGET_SIC_CODES = sorted({
     "62012", "62020", "63120", "47910", "46190", "46499",
     "70229", "73110", "74909", "68209", "64209", "68100",
     "32990", "10890", "86900", "93130", "96040", "82990",
+    "72110",
 })
+
+TECH_BIOTECH_CODES = {"62012", "72110"}
 
 FLAGGED_COUNTRY_ALIASES = {
     "france": "France",
@@ -108,6 +111,45 @@ def classify_sector(sic_codes: List[str]) -> Optional[str]:
     return None
 
 
+def parse_sector_codes(sector_value: str) -> set[str]:
+    if not sector_value:
+        return set()
+    return {code.strip() for code in str(sector_value).split(",") if code.strip()}
+
+
+def is_tech_biotech_lead(sector_value: str) -> bool:
+    return bool(parse_sector_codes(sector_value) & TECH_BIOTECH_CODES)
+
+
+def add_tech_biotech_international_flag(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a new column 'tech_biotech_international_match' to tech/biotech rows:
+      - True if:
+          * company is tech/biotech (62012 or 72110)
+          * AND has at least one matched director country (non-empty matched_director_countries)
+      - False otherwise (including non-tech/biotech rows)
+    """
+    df = df.copy()
+    df["tech_biotech_international_match"] = False
+
+    tech_mask = df["sector"].apply(is_tech_biotech_lead)
+    has_match = df["matched_director_countries"].astype(str).str.strip() != ""
+
+    df.loc[tech_mask & has_match, "tech_biotech_international_match"] = True
+
+    return df
+
+
+def split_result_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        empty_df = pd.DataFrame(columns=df.columns)
+        return empty_df, empty_df
+
+    tech_biotech_df = df[df["sector"].apply(is_tech_biotech_lead)].reset_index(drop=True)
+    matched_country_directors_df = df[~df["sector"].apply(is_tech_biotech_lead)].reset_index(drop=True)
+    return tech_biotech_df, matched_country_directors_df
+
+
 def normalize_country(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -120,7 +162,7 @@ def get_session() -> requests.Session:
     return requests.Session()
 
 
-def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], timeout: int = 30) -> requests.Response:
+def fetch_with_rotation(url: str, params: Dict[str], api_keys: List[str], timeout: int = 30) -> requests.Response:
     session = get_session()
     last_response = None
 
@@ -464,6 +506,10 @@ def main() -> None:
         existing_df = load_results(snapshot_path)
         merged_df = merge_preserving_timestamps(fetched_df, existing_df)
         screened_df = screen_new_companies_for_director_countries(merged_df, existing_df, api_keys)
+        
+        # Add tech/biotech international match flag BEFORE splitting
+        screened_df = add_tech_biotech_international_flag(screened_df)
+        
         seen_df = load_results(seen_path)
         new_df = identify_new_rows(screened_df, seen_df)
         save_state(screened_df, snapshot_path, seen_path)
@@ -474,6 +520,11 @@ def main() -> None:
         st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     else:
         current_df = load_results(snapshot_path)
+        
+        # Ensure flag is present even on cached load
+        if "tech_biotech_international_match" not in current_df.columns:
+            current_df = add_tech_biotech_international_flag(current_df)
+        
         st.session_state.setdefault("latest_df", current_df)
         st.session_state.setdefault("sorted_df", get_sorted_current_df(current_df))
         st.session_state.setdefault("new_df", pd.DataFrame(columns=RESULT_COLUMNS))
@@ -483,9 +534,14 @@ def main() -> None:
     sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
     leads_df = load_leads(selected_user, run_date)
 
-    filtered_df = sorted_df.copy()
+    # Split FIRST (tech/biotech gets ALL companies with 62012/72110)
+    tech_biotech_df, matched_country_directors_df = split_result_tables(sorted_df)
+
+    # Then apply flagged filter ONLY to matched_country_directors table
     if show_flagged_only:
-        filtered_df = filtered_df[filtered_df["director_countries_flagged"].astype(str).str.lower() == "yes"].reset_index(drop=True)
+        matched_country_directors_df = matched_country_directors_df[
+            matched_country_directors_df["director_countries_flagged"].astype(str).str.lower() == "yes"
+        ].reset_index(drop=True)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total pulled today", int(len(current_df)))
@@ -494,48 +550,42 @@ def main() -> None:
 
     st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
 
-    newest_df = filtered_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True) if not filtered_df.empty else filtered_df
+    # Quick add uses matched_country_directors (filtered by checkbox)
+    newest_df = (
+        matched_country_directors_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True)
+        if not matched_country_directors_df.empty
+        else matched_country_directors_df
+    )
     render_quick_add(newest_df, selected_user, run_date, leads_df)
 
-    with st.expander(f"{selected_user}'s leads for today", expanded=False):
-        if leads_df.empty:
-            st.info(f"No leads saved yet for {selected_user}.")
+    # Tech & Biotech table — ALWAYS shows all tech/biotech, with international match flag
+    with st.expander("Tech & Biotech Leads", expanded=True):
+        if tech_biotech_df.empty:
+            st.info("No tech or biotech leads to show yet.")
         else:
-            leads_display = leads_df.rename(columns={
-                "company_number": "Company Number",
+            tech_biotech_display = tech_biotech_df[[
+                "company_name",
+                "sector",
+                "director_countries_flagged",
+                "matched_director_countries",
+                "tech_biotech_international_match",
+                "time_added_to_table",
+            ]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "SIC Code(s)",
                 "director_countries_flagged": "Director Countries Flagged",
                 "matched_director_countries": "Matched Director Countries",
-                "added_by": "Added By",
-                "added_at": "Added At",
+                "tech_biotech_international_match": "Tech/Biotech International Match",
+                "time_added_to_table": "Time Added To Table",
             })
-            st.dataframe(leads_display, use_container_width=True, hide_index=True)
-            st.download_button(
-                label=f"Download {selected_user}'s leads CSV",
-                data=convert_leads_csv_bytes(leads_df),
-                file_name=f"{selected_user.lower()}_leads_{run_date}.csv",
-                mime="text/csv",
-                key=f"download_{selected_user.lower()}_leads",
-            )
+            st.dataframe(tech_biotech_display, use_container_width=True, hide_index=True)
 
-    with st.expander("Today's results CSV", expanded=False):
-        if not current_df.empty:
-            st.download_button(
-                label="Download today's results as CSV",
-                data=convert_results_csv_bytes(filtered_df if show_flagged_only else current_df),
-                file_name=f"companies_incorporated_{run_date}.csv",
-                mime="text/csv",
-                key="download_results_csv",
-            )
+    # Matched Country Directors table — filtered by checkbox
+    with st.expander("Matched Country Directors", expanded=False):
+        if matched_country_directors_df.empty:
+            st.info("No matched country director companies to show yet.")
         else:
-            st.info("No results available yet.")
-
-    with st.expander("Full table", expanded=False):
-        if filtered_df.empty:
-            st.info("No companies to show yet.")
-        else:
-            preview_df = filtered_df[[
+            matched_display = matched_country_directors_df[[
                 "company_name",
                 "sector",
                 "director_countries_flagged",
@@ -548,7 +598,36 @@ def main() -> None:
                 "matched_director_countries": "Matched Director Countries",
                 "time_added_to_table": "Time Added To Table",
             })
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            st.dataframe(matched_display, use_container_width=True, hide_index=True)
+
+    # CSV downloads for each table
+    with st.expander("Today's results CSV", expanded=False):
+        if current_df.empty:
+            st.info("No results available yet.")
+        else:
+            st.download_button(
+                label="Download tech & biotech leads CSV",
+                data=(
+                    tech_biotech_display.to_csv(index=False).encode("utf-8")
+                    if not tech_biotech_df.empty
+                    else b""
+                ),
+                file_name=f"tech_biotech_leads_{run_date}.csv",
+                mime="text/csv",
+                key="download_tech_biotech_csv",
+            )
+
+            st.download_button(
+                label="Download matched country directors CSV",
+                data=(
+                    matched_display.to_csv(index=False).encode("utf-8")
+                    if not matched_country_directors_df.empty
+                    else b""
+                ),
+                file_name=f"matched_country_directors_{run_date}.csv",
+                mime="text/csv",
+                key="download_matched_country_directors_csv",
+            )
 
 
 if __name__ == "__main__":
