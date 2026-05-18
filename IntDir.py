@@ -158,6 +158,7 @@ def fetch_with_rotation(
     params: Dict[str, str],
     api_keys: List[str],
     timeout: Tuple[float, float] = (3.05, 20),
+    allow_not_found: bool = False,
 ) -> requests.Response:
     session = get_session()
     last_response = None
@@ -169,10 +170,15 @@ def fetch_with_rotation(
             last_response = response
             continue
 
+        if allow_not_found and response.status_code == 404:
+            return response
+
         response.raise_for_status()
         return response
 
     if last_response is not None:
+        if allow_not_found and last_response.status_code == 404:
+            return last_response
         last_response.raise_for_status()
 
     raise RuntimeError("No valid Companies House API keys were available.")
@@ -251,23 +257,42 @@ def fetch_director_country_flags_cached(company_number: str, api_keys_tuple: tup
             "start_index": str(start_index),
         }
 
-        response = fetch_with_rotation(url, params, api_keys)
-        payload = response.json()
-        items = payload.get("items", []) or []
+        try:
+            response = fetch_with_rotation(
+                url=url,
+                params=params,
+                api_keys=api_keys,
+                allow_not_found=True,
+            )
 
-        for officer in items:
-            if str(officer.get("officer_role", "")).strip().lower() != "director":
-                continue
+            if response.status_code == 404:
+                return "No", ""
 
-            normalized_country = normalize_country(officer.get("country_of_residence", ""))
-            if normalized_country:
-                matched_countries.add(normalized_country)
+            payload = response.json()
+            items = payload.get("items", []) or []
 
-        total_results = int(payload.get("total_results", len(items)))
-        start_index += len(items)
+            for officer in items:
+                if str(officer.get("officer_role", "")).strip().lower() != "director":
+                    continue
 
-        if not items or start_index >= total_results:
-            break
+                normalized_country = normalize_country(officer.get("country_of_residence", ""))
+                if normalized_country:
+                    matched_countries.add(normalized_country)
+
+            total_results = int(payload.get("total_results", len(items)))
+            start_index += len(items)
+
+            if not items or start_index >= total_results:
+                break
+
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (400, 403, 404):
+                return "No", ""
+            raise
+
+        except requests.RequestException:
+            return "No", ""
 
     if matched_countries:
         return "Yes", ", ".join(sorted(matched_countries))
@@ -334,13 +359,14 @@ def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.Dat
 def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -> None:
     save_df = current_df.copy()
 
-    if "is_tech_biotech" in save_df.columns:
-        save_df = save_df.drop(columns=["is_tech_biotech"])
-    if "tech_biotech_international_match" in save_df.columns:
-        save_df = save_df.drop(columns=["tech_biotech_international_match"])
+    for transient_col in ["is_tech_biotech", "tech_biotech_international_match"]:
+        if transient_col in save_df.columns:
+            save_df = save_df.drop(columns=[transient_col])
 
     save_df.to_csv(snapshot_path, index=False)
     save_df.to_csv(seen_path, index=False)
+
+    load_results_csv.clear()
 
 
 def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_leads: pd.DataFrame) -> bool:
@@ -386,6 +412,7 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["is_tech_biotech"] = df["sector"].str.split(",").apply(
         lambda parts: bool({p.strip() for p in parts if p.strip()} & TECH_BIOTECH_CODES)
     )
+
     df["tech_biotech_international_match"] = (
         df["is_tech_biotech"] &
         df["matched_director_countries"].str.strip().ne("")
@@ -454,25 +481,39 @@ def screen_only_new_companies(
 
     if known_mask.any():
         screened_df.loc[known_mask, "director_countries_flagged"] = (
-            screened_df.loc[known_mask, "company_number"].map(existing_lookup["director_countries_flagged"]).fillna("No")
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["director_countries_flagged"])
+            .fillna("No")
         )
         screened_df.loc[known_mask, "matched_director_countries"] = (
-            screened_df.loc[known_mask, "company_number"].map(existing_lookup["matched_director_countries"]).fillna("")
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["matched_director_countries"])
+            .fillna("")
         )
         screened_df.loc[known_mask, "time_added_to_table"] = (
-            screened_df.loc[known_mask, "company_number"].map(existing_lookup["time_added_to_table"]).fillna(screened_df["time_added_to_table"])
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["time_added_to_table"])
+            .fillna(screened_df.loc[known_mask, "time_added_to_table"])
         )
         screened_df.loc[known_mask, "pull_order"] = (
-            screened_df.loc[known_mask, "company_number"].map(existing_lookup["pull_order"]).fillna(screened_df["pull_order"])
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["pull_order"])
+            .fillna(screened_df.loc[known_mask, "pull_order"])
         )
 
     new_mask = ~known_mask
     if new_mask.any():
         new_company_numbers = screened_df.loc[new_mask, "company_number"].tolist()
-        flags_lookup = {
-            company_number: fetch_director_country_flags_cached(company_number, tuple(api_keys))
-            for company_number in new_company_numbers
-        }
+        flags_lookup = {}
+
+        for company_number in new_company_numbers:
+            try:
+                flags_lookup[company_number] = fetch_director_country_flags_cached(
+                    company_number,
+                    tuple(api_keys),
+                )
+            except Exception:
+                flags_lookup[company_number] = ("No", "")
 
         screened_df.loc[new_mask, "director_countries_flagged"] = (
             screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][0])
@@ -550,7 +591,6 @@ def main() -> None:
         with st.spinner("Refreshing Companies House data..."):
             fetched_df = fetch_companies_incorporated_today(tuple(api_keys), run_date)
             existing_df = load_results(snapshot_path)
-
             screened_df = screen_only_new_companies(fetched_df, existing_df, api_keys)
             screened_df = add_derived_columns(screened_df)
 
