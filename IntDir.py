@@ -1,3 +1,5 @@
+Code
+
 import base64
 from datetime import datetime
 from pathlib import Path
@@ -40,18 +42,6 @@ FLAGGED_COUNTRY_ALIASES = {
     "austria": "Austria",
 }
 
-UK_COUNTRY_ALIASES = {
-    "uk": "United Kingdom",
-    "u.k.": "United Kingdom",
-    "united kingdom": "United Kingdom",
-    "great britain": "United Kingdom",
-    "britain": "United Kingdom",
-    "england": "United Kingdom",
-    "scotland": "United Kingdom",
-    "wales": "United Kingdom",
-    "northern ireland": "United Kingdom",
-}
-
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LEADS_DIR = DATA_DIR / "leads"
@@ -65,8 +55,6 @@ RESULT_COLUMNS = [
     "sector",
     "director_countries_flagged",
     "matched_director_countries",
-    "director_resides_in_uk",
-    "matched_uk_director_residence",
     "time_added_to_table",
     "pull_order",
 ]
@@ -77,8 +65,6 @@ LEAD_COLUMNS = [
     "sector",
     "director_countries_flagged",
     "matched_director_countries",
-    "director_resides_in_uk",
-    "matched_uk_director_residence",
     "added_by",
     "added_at",
 ]
@@ -138,11 +124,21 @@ def is_tech_biotech_lead(sector_value: str) -> bool:
 
 
 def add_tech_biotech_international_flag(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a new column 'tech_biotech_international_match' to tech/biotech rows:
+      - True if:
+          * company is tech/biotech (62012 or 72110)
+          * AND has at least one matched director country (non-empty matched_director_countries)
+      - False otherwise (including non-tech/biotech rows)
+    """
     df = df.copy()
     df["tech_biotech_international_match"] = False
+
     tech_mask = df["sector"].apply(is_tech_biotech_lead)
     has_match = df["matched_director_countries"].astype(str).str.strip() != ""
+
     df.loc[tech_mask & has_match, "tech_biotech_international_match"] = True
+
     return df
 
 
@@ -163,19 +159,12 @@ def normalize_country(value: Optional[str]) -> str:
     return FLAGGED_COUNTRY_ALIASES.get(cleaned, "")
 
 
-def normalize_uk_country(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    cleaned = " ".join(str(value).strip().lower().split())
-    return UK_COUNTRY_ALIASES.get(cleaned, "")
-
-
 @st.cache_resource(show_spinner=False)
 def get_session() -> requests.Session:
     return requests.Session()
 
 
-def fetch_with_rotation(url: str, params: Dict, api_keys: List[str], timeout: int = 30) -> requests.Response:
+def fetch_with_rotation(url: str, params: Dict[str], api_keys: List[str], timeout: int = 30) -> requests.Response:
     session = get_session()
     last_response = None
 
@@ -224,8 +213,6 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
                 "sector": sector,
                 "director_countries_flagged": "No",
                 "matched_director_countries": "",
-                "director_resides_in_uk": "No",
-                "matched_uk_director_residence": "",
                 "time_added_to_table": now_uk_str(),
                 "pull_order": pull_counter,
             })
@@ -246,12 +233,11 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
     )
 
 
-def fetch_director_country_flags(company_number: str, api_keys: List[str]) -> Tuple[str, str, str, str]:
+def fetch_director_country_flags(company_number: str, api_keys: List[str]) -> Tuple[str, str]:
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
     start_index = 0
     items_per_page = 100
     matched_countries = set()
-    matched_uk_residence = set()
 
     while True:
         params = {
@@ -266,15 +252,9 @@ def fetch_director_country_flags(company_number: str, api_keys: List[str]) -> Tu
             if str(officer.get("officer_role", "")).strip().lower() != "director":
                 continue
 
-            residence_raw = officer.get("country_of_residence", "")
-
-            normalized_country = normalize_country(residence_raw)
+            normalized_country = normalize_country(officer.get("country_of_residence", ""))
             if normalized_country:
                 matched_countries.add(normalized_country)
-
-            normalized_uk = normalize_uk_country(residence_raw)
-            if normalized_uk:
-                matched_uk_residence.add(normalized_uk)
 
         total_results = int(payload.get("total_results", len(items)))
         start_index += len(items)
@@ -282,11 +262,9 @@ def fetch_director_country_flags(company_number: str, api_keys: List[str]) -> Tu
         if not items or start_index >= total_results:
             break
 
-    flagged = "Yes" if matched_countries else "No"
-    matched = ", ".join(sorted(matched_countries))
-    uk_flag = "Yes" if matched_uk_residence else "No"
-    uk_matched = ", ".join(sorted(matched_uk_residence))
-    return flagged, matched, uk_flag, uk_matched
+    if matched_countries:
+        return "Yes", ", ".join(sorted(matched_countries))
+    return "No", ""
 
 
 def screen_new_companies_for_director_countries(
@@ -305,12 +283,7 @@ def screen_new_companies_for_director_countries(
         existing_tmp["company_number"] = existing_tmp["company_number"].astype(str).str.strip()
         existing_tmp = existing_tmp.drop_duplicates(subset=["company_number"], keep="first")
         existing_lookup = existing_tmp.set_index("company_number")[
-            [
-                "director_countries_flagged",
-                "matched_director_countries",
-                "director_resides_in_uk",
-                "matched_uk_director_residence",
-            ]
+            ["director_countries_flagged", "matched_director_countries"]
         ].to_dict("index")
 
     for idx, row in screened_df.iterrows():
@@ -322,15 +295,11 @@ def screen_new_companies_for_director_countries(
         if cached:
             screened_df.at[idx, "director_countries_flagged"] = str(cached.get("director_countries_flagged", "No"))
             screened_df.at[idx, "matched_director_countries"] = str(cached.get("matched_director_countries", ""))
-            screened_df.at[idx, "director_resides_in_uk"] = str(cached.get("director_resides_in_uk", "No"))
-            screened_df.at[idx, "matched_uk_director_residence"] = str(cached.get("matched_uk_director_residence", ""))
             continue
 
-        flagged, matched, uk_flag, uk_matched = fetch_director_country_flags(company_number, api_keys)
+        flagged, matched = fetch_director_country_flags(company_number, api_keys)
         screened_df.at[idx, "director_countries_flagged"] = flagged
         screened_df.at[idx, "matched_director_countries"] = matched
-        screened_df.at[idx, "director_resides_in_uk"] = uk_flag
-        screened_df.at[idx, "matched_uk_director_residence"] = uk_matched
 
     return screened_df
 
@@ -411,8 +380,6 @@ def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_le
         "sector": str(row.get("sector", "")).strip(),
         "director_countries_flagged": str(row.get("director_countries_flagged", "No")).strip(),
         "matched_director_countries": str(row.get("matched_director_countries", "")).strip(),
-        "director_resides_in_uk": str(row.get("director_resides_in_uk", "No")).strip(),
-        "matched_uk_director_residence": str(row.get("matched_uk_director_residence", "")).strip(),
         "added_by": person,
         "added_at": now_uk_str(),
     }], columns=LEAD_COLUMNS)
@@ -433,16 +400,12 @@ def convert_results_csv_bytes(df: pd.DataFrame) -> bytes:
         "sector",
         "director_countries_flagged",
         "matched_director_countries",
-        "director_resides_in_uk",
-        "matched_uk_director_residence",
         "time_added_to_table",
     ]].rename(columns={
         "company_name": "Company Name",
         "sector": "SIC Code(s)",
         "director_countries_flagged": "Director Countries Flagged",
         "matched_director_countries": "Matched Director Countries",
-        "director_resides_in_uk": "Director Resides In UK",
-        "matched_uk_director_residence": "Matched UK Director Residence",
         "time_added_to_table": "Time Added To Table",
     })
     return export_df.to_csv(index=False).encode("utf-8")
@@ -458,8 +421,6 @@ def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
         "sector": "SIC Code(s)",
         "director_countries_flagged": "Director Countries Flagged",
         "matched_director_countries": "Matched Director Countries",
-        "director_resides_in_uk": "Director Resides In UK",
-        "matched_uk_director_residence": "Matched UK Director Residence",
         "added_by": "Added By",
         "added_at": "Added At",
     })
@@ -484,25 +445,17 @@ def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFr
         return fetched_df.copy()
 
     existing_lookup = existing_df.set_index("company_number")[
-        [
-            "time_added_to_table",
-            "pull_order",
-            "director_countries_flagged",
-            "matched_director_countries",
-            "director_resides_in_uk",
-            "matched_uk_director_residence",
-        ]
+        ["time_added_to_table", "pull_order", "director_countries_flagged", "matched_director_countries"]
     ]
     existing_numbers = set(existing_df["company_number"].astype(str))
 
     new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+
     known_rows = fetched_df[fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
     known_rows["time_added_to_table"] = known_rows["company_number"].map(existing_lookup["time_added_to_table"])
     known_rows["pull_order"] = known_rows["company_number"].map(existing_lookup["pull_order"].astype(int))
     known_rows["director_countries_flagged"] = known_rows["company_number"].map(existing_lookup["director_countries_flagged"])
     known_rows["matched_director_countries"] = known_rows["company_number"].map(existing_lookup["matched_director_countries"])
-    known_rows["director_resides_in_uk"] = known_rows["company_number"].map(existing_lookup["director_resides_in_uk"])
-    known_rows["matched_uk_director_residence"] = known_rows["company_number"].map(existing_lookup["matched_uk_director_residence"])
 
     merged = pd.concat([new_rows, known_rows], ignore_index=True)
     return merged.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
@@ -519,16 +472,15 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
     for idx, (_, row) in enumerate(df.iterrows()):
         company_number = str(row.get("company_number", "")).strip()
         already_added = company_number in existing_numbers
-        c1, c2, c3, c4, c5, c6 = st.columns([4.0, 1.0, 1.6, 1.6, 1.6, 0.9])
+        c1, c2, c3, c4, c5 = st.columns([4.5, 1.2, 2.2, 2.2, 0.9])
         c1.write(f"**{row['company_name']}**")
         c2.write(str(row["sector"]))
         c3.write(str(row["matched_director_countries"]) if str(row["matched_director_countries"]).strip() else "-")
-        c4.write(str(row["matched_uk_director_residence"]) if str(row["matched_uk_director_residence"]).strip() else "-")
-        c5.write(str(row["time_added_to_table"]))
+        c4.write(str(row["time_added_to_table"]))
         if already_added:
-            c6.caption("Added")
+            c5.caption("Added")
         else:
-            if c6.button("Add", key=f"add_{person}_{company_number}_{idx}"):
+            if c5.button("Add", key=f"add_{person}_{company_number}_{idx}"):
                 added = add_company_to_leads(person, run_date, row, existing_leads)
                 if added:
                     st.rerun()
@@ -556,18 +508,25 @@ def main() -> None:
         existing_df = load_results(snapshot_path)
         merged_df = merge_preserving_timestamps(fetched_df, existing_df)
         screened_df = screen_new_companies_for_director_countries(merged_df, existing_df, api_keys)
+        
+        # Add tech/biotech international match flag BEFORE splitting
         screened_df = add_tech_biotech_international_flag(screened_df)
+        
         seen_df = load_results(seen_path)
         new_df = identify_new_rows(screened_df, seen_df)
         save_state(screened_df, snapshot_path, seen_path)
+
         st.session_state["latest_df"] = screened_df
         st.session_state["sorted_df"] = get_sorted_current_df(screened_df)
         st.session_state["new_df"] = new_df
         st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     else:
         current_df = load_results(snapshot_path)
+        
+        # Ensure flag is present even on cached load
         if "tech_biotech_international_match" not in current_df.columns:
             current_df = add_tech_biotech_international_flag(current_df)
+        
         st.session_state.setdefault("latest_df", current_df)
         st.session_state.setdefault("sorted_df", get_sorted_current_df(current_df))
         st.session_state.setdefault("new_df", pd.DataFrame(columns=RESULT_COLUMNS))
@@ -577,27 +536,23 @@ def main() -> None:
     sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
     leads_df = load_leads(selected_user, run_date)
 
+    # Split FIRST (tech/biotech gets ALL companies with 62012/72110)
     tech_biotech_df, matched_country_directors_df = split_result_tables(sorted_df)
 
+    # Then apply flagged filter ONLY to matched_country_directors table
     if show_flagged_only:
         matched_country_directors_df = matched_country_directors_df[
             matched_country_directors_df["director_countries_flagged"].astype(str).str.lower() == "yes"
         ].reset_index(drop=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Total pulled today", int(len(current_df)))
-    c2.metric(
-        "Flagged by director country",
-        int((current_df["director_countries_flagged"].astype(str).str.lower() == "yes").sum()) if not current_df.empty else 0,
-    )
-    c3.metric(
-        "UK residence detected",
-        int((current_df["director_resides_in_uk"].astype(str).str.lower() == "yes").sum()) if not current_df.empty else 0,
-    )
-    c4.metric(f"{selected_user}'s leads today", int(len(leads_df)))
+    c2.metric("Flagged by director country", int((current_df["director_countries_flagged"].astype(str).str.lower() == "yes").sum()) if not current_df.empty else 0)
+    c3.metric(f"{selected_user}'s leads today", int(len(leads_df)))
 
     st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
 
+    # Quick add uses matched_country_directors (filtered by checkbox)
     newest_df = (
         matched_country_directors_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True)
         if not matched_country_directors_df.empty
@@ -605,6 +560,7 @@ def main() -> None:
     )
     render_quick_add(newest_df, selected_user, run_date, leads_df)
 
+    # Tech & Biotech table — ALWAYS shows all tech/biotech, with international match flag
     with st.expander("Tech & Biotech Leads", expanded=True):
         if tech_biotech_df.empty:
             st.info("No tech or biotech leads to show yet.")
@@ -614,8 +570,6 @@ def main() -> None:
                 "sector",
                 "director_countries_flagged",
                 "matched_director_countries",
-                "director_resides_in_uk",
-                "matched_uk_director_residence",
                 "tech_biotech_international_match",
                 "time_added_to_table",
             ]].rename(columns={
@@ -623,13 +577,12 @@ def main() -> None:
                 "sector": "SIC Code(s)",
                 "director_countries_flagged": "Director Countries Flagged",
                 "matched_director_countries": "Matched Director Countries",
-                "director_resides_in_uk": "Director Resides In UK",
-                "matched_uk_director_residence": "Matched UK Director Residence",
                 "tech_biotech_international_match": "Tech/Biotech International Match",
                 "time_added_to_table": "Time Added To Table",
             })
             st.dataframe(tech_biotech_display, use_container_width=True, hide_index=True)
 
+    # Matched Country Directors table — filtered by checkbox
     with st.expander("Matched Country Directors", expanded=False):
         if matched_country_directors_df.empty:
             st.info("No matched country director companies to show yet.")
@@ -639,20 +592,17 @@ def main() -> None:
                 "sector",
                 "director_countries_flagged",
                 "matched_director_countries",
-                "director_resides_in_uk",
-                "matched_uk_director_residence",
                 "time_added_to_table",
             ]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "SIC Code(s)",
                 "director_countries_flagged": "Director Countries Flagged",
                 "matched_director_countries": "Matched Director Countries",
-                "director_resides_in_uk": "Director Resides In UK",
-                "matched_uk_director_residence": "Matched UK Director Residence",
                 "time_added_to_table": "Time Added To Table",
             })
             st.dataframe(matched_display, use_container_width=True, hide_index=True)
 
+    # CSV downloads for each table
     with st.expander("Today's results CSV", expanded=False):
         if current_df.empty:
             st.info("No results available yet.")
