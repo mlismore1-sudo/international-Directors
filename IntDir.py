@@ -1,5 +1,3 @@
-Code
-
 import base64
 from datetime import datetime
 from pathlib import Path
