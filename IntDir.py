@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from pandas.errors import EmptyDataError, ParserError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -335,10 +336,14 @@ def lead_file_path(person: str, run_date: str) -> Path:
 @st.cache_data(show_spinner=False)
 def load_results_csv(path_str: str, mtime: float) -> pd.DataFrame:
     path = Path(path_str)
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=RESULT_COLUMNS)
 
-    df = pd.read_csv(path, dtype="string").fillna("")
+    try:
+        df = pd.read_csv(path, dtype="string").fillna("")
+    except EmptyDataError:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
     for col in RESULT_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -348,10 +353,16 @@ def load_results_csv(path_str: str, mtime: float) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_leads_csv(path_str: str, mtime: float) -> pd.DataFrame:
     path = Path(path_str)
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=LEAD_COLUMNS)
 
-    df = pd.read_csv(path, dtype="string").fillna("")
+    try:
+        df = pd.read_csv(path, dtype="string", on_bad_lines="skip").fillna("")
+    except (EmptyDataError, ParserError):
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+    except Exception:
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+
     for col in LEAD_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -413,10 +424,8 @@ def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_le
         "added_at": now_uk_str(),
     }], columns=LEAD_COLUMNS)
 
-    if path.exists():
-        new_row.to_csv(path, mode="a", index=False, header=False)
-    else:
-        new_row.to_csv(path, index=False)
+    file_exists = path.exists() and path.stat().st_size > 0
+    new_row.to_csv(path, mode="a", index=False, header=not file_exists)
 
     load_leads_csv.clear()
     return True
