@@ -20,6 +20,9 @@ TARGET_SIC_CODES = tuple(sorted({
 TARGET_SIC_CODE_SET = set(TARGET_SIC_CODES)
 
 TECH_BIOTECH_CODES = {"62012", "72110"}
+UK_COUNTRY_ALIASES = {
+    "uk", "u.k.", "united kingdom", "england", "scotland", "wales", "northern ireland", "great britain", "britain"
+}
 
 FLAGGED_COUNTRY_ALIASES = {
     "france": "France",
@@ -59,6 +62,7 @@ RESULT_COLUMNS = [
     "sector",
     "director_countries_flagged",
     "matched_director_countries",
+    "uk_director",
     "time_added_to_table",
     "pull_order",
 ]
@@ -69,6 +73,7 @@ LEAD_COLUMNS = [
     "sector",
     "director_countries_flagged",
     "matched_director_countries",
+    "uk_director",
     "added_by",
     "added_at",
 ]
@@ -123,11 +128,19 @@ def parse_sector_codes(sector_value: str) -> set[str]:
     return {code.strip() for code in str(sector_value).split(",") if code.strip()}
 
 
-def normalize_country(value: Optional[str]) -> str:
+def clean_country(value: Optional[str]) -> str:
     if not value:
         return ""
-    cleaned = " ".join(str(value).strip().lower().split())
+    return " ".join(str(value).strip().lower().split())
+
+
+def normalize_country(value: Optional[str]) -> str:
+    cleaned = clean_country(value)
     return FLAGGED_COUNTRY_ALIASES.get(cleaned, "")
+
+
+def is_uk_country(value: Optional[str]) -> bool:
+    return clean_country(value) in UK_COUNTRY_ALIASES
 
 
 @st.cache_resource(show_spinner=False)
@@ -221,6 +234,7 @@ def fetch_companies_incorporated_today(api_keys_tuple: tuple[str, ...], run_date
                 "sector": sector,
                 "director_countries_flagged": "No",
                 "matched_director_countries": "",
+                "uk_director": "No",
                 "time_added_to_table": timestamp,
                 "pull_order": pull_counter,
             })
@@ -244,12 +258,13 @@ def fetch_companies_incorporated_today(api_keys_tuple: tuple[str, ...], run_date
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_director_country_flags_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str]:
+def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str]:
     api_keys = list(api_keys_tuple)
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
     start_index = 0
     items_per_page = 100
     matched_countries = set()
+    has_uk_director = False
 
     while True:
         params = {
@@ -266,7 +281,7 @@ def fetch_director_country_flags_cached(company_number: str, api_keys_tuple: tup
             )
 
             if response.status_code == 404:
-                return "No", ""
+                return "No", "", "No"
 
             payload = response.json()
             items = payload.get("items", []) or []
@@ -275,9 +290,12 @@ def fetch_director_country_flags_cached(company_number: str, api_keys_tuple: tup
                 if str(officer.get("officer_role", "")).strip().lower() != "director":
                     continue
 
-                normalized_country = normalize_country(officer.get("country_of_residence", ""))
+                country_of_residence = officer.get("country_of_residence", "")
+                normalized_country = normalize_country(country_of_residence)
                 if normalized_country:
                     matched_countries.add(normalized_country)
+                if is_uk_country(country_of_residence):
+                    has_uk_director = True
 
             total_results = int(payload.get("total_results", len(items)))
             start_index += len(items)
@@ -288,15 +306,20 @@ def fetch_director_country_flags_cached(company_number: str, api_keys_tuple: tup
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status in (400, 403, 404):
-                return "No", ""
+                return "No", "", "No"
             raise
 
         except requests.RequestException:
-            return "No", ""
+            return "No", "", "No"
 
     if matched_countries:
-        return "Yes", ", ".join(sorted(matched_countries))
-    return "No", ""
+        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_director else "No"
+    return "No", "", "Yes" if has_uk_director else "No"
+
+
+def fetch_director_screening_fresh(company_number: str, api_keys: List[str]) -> Tuple[str, str, str]:
+    fetch_director_screening_cached.clear()
+    return fetch_director_screening_cached(company_number, tuple(api_keys))
 
 
 def get_store_paths(run_date: str) -> Tuple[Path, Path]:
@@ -385,6 +408,7 @@ def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_le
         "sector": str(row.get("sector", "")).strip(),
         "director_countries_flagged": str(row.get("director_countries_flagged", "No")).strip(),
         "matched_director_countries": str(row.get("matched_director_countries", "")).strip(),
+        "uk_director": str(row.get("uk_director", "No")).strip(),
         "added_by": person,
         "added_at": now_uk_str(),
     }], columns=LEAD_COLUMNS)
@@ -408,6 +432,9 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df["sector"] = df["sector"].fillna("").astype(str)
     df["matched_director_countries"] = df["matched_director_countries"].fillna("").astype(str)
+    if "uk_director" not in df.columns:
+        df["uk_director"] = ""
+    df["uk_director"] = df["uk_director"].fillna("No").astype(str)
 
     df["is_tech_biotech"] = df["sector"].str.split(",").apply(
         lambda parts: bool({p.strip() for p in parts if p.strip()} & TECH_BIOTECH_CODES)
@@ -463,6 +490,7 @@ def screen_only_new_companies(
         existing_lookup = pd.DataFrame(columns=[
             "director_countries_flagged",
             "matched_director_countries",
+            "uk_director",
             "time_added_to_table",
             "pull_order",
         ])
@@ -470,10 +498,12 @@ def screen_only_new_companies(
     else:
         tmp = existing_df.copy()
         tmp["company_number"] = tmp["company_number"].astype(str).str.strip()
+        if "uk_director" not in tmp.columns:
+            tmp["uk_director"] = "No"
         tmp["pull_order"] = pd.to_numeric(tmp["pull_order"], errors="coerce").fillna(-1).astype(int)
         tmp = tmp.drop_duplicates(subset=["company_number"], keep="first")
         existing_lookup = tmp.set_index("company_number")[
-            ["director_countries_flagged", "matched_director_countries", "time_added_to_table", "pull_order"]
+            ["director_countries_flagged", "matched_director_countries", "uk_director", "time_added_to_table", "pull_order"]
         ]
         existing_numbers = set(existing_lookup.index)
 
@@ -489,6 +519,11 @@ def screen_only_new_companies(
             screened_df.loc[known_mask, "company_number"]
             .map(existing_lookup["matched_director_countries"])
             .fillna("")
+        )
+        screened_df.loc[known_mask, "uk_director"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["uk_director"])
+            .fillna("No")
         )
         screened_df.loc[known_mask, "time_added_to_table"] = (
             screened_df.loc[known_mask, "company_number"]
@@ -508,18 +543,21 @@ def screen_only_new_companies(
 
         for company_number in new_company_numbers:
             try:
-                flags_lookup[company_number] = fetch_director_country_flags_cached(
+                flags_lookup[company_number] = fetch_director_screening_cached(
                     company_number,
                     tuple(api_keys),
                 )
             except Exception:
-                flags_lookup[company_number] = ("No", "")
+                flags_lookup[company_number] = ("No", "", "No")
 
         screened_df.loc[new_mask, "director_countries_flagged"] = (
             screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][0])
         )
         screened_df.loc[new_mask, "matched_director_countries"] = (
             screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][1])
+        )
+        screened_df.loc[new_mask, "uk_director"] = (
+            screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][2])
         )
 
     screened_df["pull_order"] = pd.to_numeric(screened_df["pull_order"], errors="coerce").fillna(-1).astype(int)
@@ -529,6 +567,35 @@ def screen_only_new_companies(
         .drop_duplicates(subset=["company_number"], keep="first")
         .reset_index(drop=True)
     )
+
+
+def rescreen_company_in_state(company_number: str, api_keys: List[str], snapshot_path: Path, seen_path: Path) -> bool:
+    latest_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    if latest_df.empty:
+        return False
+
+    working_df = latest_df.copy()
+    working_df["company_number"] = working_df["company_number"].astype(str).str.strip()
+    match_mask = working_df["company_number"] == str(company_number).strip()
+    if not match_mask.any():
+        return False
+
+    try:
+        flagged, matched_countries, uk_director = fetch_director_screening_fresh(company_number, api_keys)
+    except Exception:
+        return False
+
+    working_df.loc[match_mask, "director_countries_flagged"] = flagged
+    working_df.loc[match_mask, "matched_director_countries"] = matched_countries
+    working_df.loc[match_mask, "uk_director"] = uk_director
+
+    working_df = add_derived_columns(working_df)
+    working_df = get_sorted_current_df(working_df)
+    save_state(working_df, snapshot_path, seen_path)
+
+    st.session_state["latest_df"] = working_df
+    st.session_state["sorted_df"] = working_df
+    return True
 
 
 def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
@@ -544,16 +611,17 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
         company_number = str(row.company_number).strip()
         already_added = company_number in existing_numbers
 
-        c1, c2, c3, c4, c5 = st.columns([4.5, 1.2, 2.2, 2.2, 0.9])
+        c1, c2, c3, c4, c5, c6 = st.columns([4.0, 1.1, 1.8, 2.0, 2.1, 0.9])
         c1.write(f"**{row.company_name}**")
         c2.write(str(row.sector))
-        c3.write(str(row.matched_director_countries).strip() if str(row.matched_director_countries).strip() else "-")
-        c4.write(str(row.time_added_to_table))
+        c3.write(str(row.uk_director))
+        c4.write(str(row.matched_director_countries).strip() if str(row.matched_director_countries).strip() else "-")
+        c5.write(str(row.time_added_to_table))
 
         if already_added:
-            c5.caption("Added")
+            c6.caption("Added")
         else:
-            if c5.button("Add", key=f"add_{person}_{company_number}_{idx}"):
+            if c6.button("Add", key=f"add_{person}_{company_number}_{idx}"):
                 added = add_company_to_leads(
                     person,
                     run_date,
@@ -563,11 +631,43 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
                         "sector": row.sector,
                         "director_countries_flagged": row.director_countries_flagged,
                         "matched_director_countries": row.matched_director_countries,
+                        "uk_director": row.uk_director,
                     }),
                     existing_leads,
                 )
                 if added:
                     st.rerun()
+
+
+def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: Path) -> None:
+    with st.expander("Manual re-screen", expanded=False):
+        latest_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
+        if latest_df.empty:
+            st.info("No companies available to re-screen yet.")
+            return
+
+        options_df = latest_df[["company_name", "company_number"]].copy()
+        options_df["label"] = options_df.apply(
+            lambda row: f"{row['company_name']} ({row['company_number']})", axis=1
+        )
+        options = options_df["label"].tolist()
+        label_to_company = dict(zip(options_df["label"], options_df["company_number"]))
+
+        selected_label = st.selectbox(
+            "Select a company to re-screen",
+            options,
+            key="manual_rescreen_company",
+        )
+
+        if st.button("Re-screen selected company", key="manual_rescreen_button"):
+            company_number = label_to_company[selected_label]
+            with st.spinner("Re-screening selected company..."):
+                updated = rescreen_company_in_state(company_number, api_keys, snapshot_path, seen_path)
+            if updated:
+                st.success(f"Re-screened {selected_label} using fresh Companies House officer data.")
+                st.rerun()
+            else:
+                st.error("Unable to re-screen that company right now.")
 
 
 def main() -> None:
@@ -636,6 +736,8 @@ def main() -> None:
 
     st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
 
+    render_manual_rescreen(api_keys, snapshot_path, seen_path)
+
     newest_df = matched_country_directors_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True)
     render_quick_add(newest_df, selected_user, run_date, leads_df)
 
@@ -646,6 +748,7 @@ def main() -> None:
             tech_biotech_display = tech_biotech_df[[
                 "company_name",
                 "sector",
+                "uk_director",
                 "director_countries_flagged",
                 "matched_director_countries",
                 "tech_biotech_international_match",
@@ -653,6 +756,7 @@ def main() -> None:
             ]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "SIC Code(s)",
+                "uk_director": "UK Director",
                 "director_countries_flagged": "Director Countries Flagged",
                 "matched_director_countries": "Matched Director Countries",
                 "tech_biotech_international_match": "Tech/Biotech International Match",
@@ -667,12 +771,14 @@ def main() -> None:
             matched_display = matched_country_directors_df[[
                 "company_name",
                 "sector",
+                "uk_director",
                 "director_countries_flagged",
                 "matched_director_countries",
                 "time_added_to_table",
             ]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "SIC Code(s)",
+                "uk_director": "UK Director",
                 "director_countries_flagged": "Director Countries Flagged",
                 "matched_director_countries": "Matched Director Countries",
                 "time_added_to_table": "Time Added To Table",
