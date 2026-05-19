@@ -646,28 +646,60 @@ def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: 
             st.info("No companies available to re-screen yet.")
             return
 
-        options_df = latest_df[["company_name", "company_number"]].copy()
-        options_df["label"] = options_df.apply(
-            lambda row: f"{row['company_name']} ({row['company_number']})", axis=1
-        )
-        options = options_df["label"].tolist()
-        label_to_company = dict(zip(options_df["label"], options_df["company_number"]))
+        unscreened_df = latest_df[
+            latest_df["director_countries_flagged"].astype(str).str.lower() != "yes"
+        ].copy()
 
-        selected_label = st.selectbox(
-            "Select a company to re-screen",
-            options,
-            key="manual_rescreen_company",
-        )
+        total_to_rescreen = len(unscreened_df)
+        if total_to_rescreen == 0:
+            st.success("All companies currently shown have already been identified with a target country director.")
+            return
 
-        if st.button("Re-screen selected company", key="manual_rescreen_button"):
-            company_number = label_to_company[selected_label]
-            with st.spinner("Re-screening selected company..."):
-                updated = rescreen_company_in_state(company_number, api_keys, snapshot_path, seen_path)
-            if updated:
-                st.success(f"Re-screened {selected_label} using fresh Companies House officer data.")
-                st.rerun()
-            else:
-                st.error("Unable to re-screen that company right now.")
+        st.write(f"Companies available for one-click re-screen: **{total_to_rescreen}**")
+
+        if st.button("Re-screen all non-flagged companies", key="manual_rescreen_button"):
+            working_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS)).copy()
+            if working_df.empty:
+                st.error("Unable to load companies for re-screening right now.")
+                return
+
+            working_df["company_number"] = working_df["company_number"].astype(str).str.strip()
+            company_numbers = unscreened_df["company_number"].astype(str).str.strip().tolist()
+            updated_count = 0
+
+            fetch_director_screening_cached.clear()
+
+            with st.spinner(f"Re-screening {total_to_rescreen} non-flagged companies..."):
+                for company_number in company_numbers:
+                    try:
+                        flagged, matched_countries, uk_director = fetch_director_screening_cached(
+                            company_number,
+                            tuple(api_keys),
+                        )
+                    except Exception:
+                        continue
+
+                    match_mask = working_df["company_number"] == company_number
+                    if not match_mask.any():
+                        continue
+
+                    working_df.loc[match_mask, "director_countries_flagged"] = flagged
+                    working_df.loc[match_mask, "matched_director_countries"] = matched_countries
+                    working_df.loc[match_mask, "uk_director"] = uk_director
+                    updated_count += 1
+
+            if updated_count == 0:
+                st.error("Unable to re-screen the non-flagged companies right now.")
+                return
+
+            working_df = add_derived_columns(working_df)
+            working_df = get_sorted_current_df(working_df)
+            save_state(working_df, snapshot_path, seen_path)
+
+            st.session_state["latest_df"] = working_df
+            st.session_state["sorted_df"] = working_df
+            st.success(f"Re-screened {updated_count} non-flagged companies using fresh Companies House officer data.")
+            st.rerun()
 
 
 def main() -> None:
