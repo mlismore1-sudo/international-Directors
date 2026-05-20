@@ -417,7 +417,7 @@ def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
     return {
         "Company Name":              profile.get("company_name", ""),
         "SIC Codes":                 ", ".join(map(str, sics)),
-        "Director Nationality":      "🌍 " + off["director_target_details"] if off["director_from_target_country"] else "—",
+        "Director from Target Country": "🌍 " + off["director_target_details"] if off["director_from_target_country"] else "—",
         "Owned by Another Company":  "👨‍👧 " + psc["owning_company_names"] if psc["owned_by_company"] else "No",
         "PSC from Target Country":   "🌍 " + psc["psc_target_details"] if psc["psc_from_target_country"] else "—",
         "Publishable":               "✅ Yes" if pub["should_publish"] else "❌ No",
@@ -603,7 +603,7 @@ def render_kpis(df: pd.DataFrame) -> None:
     publishable = int((df["Publishable"] == "✅ Yes").sum()) if "Publishable" in df.columns else 0
     owned_co    = int(df["Owned by Another Company"].str.startswith("👨").sum()) if "Owned by Another Company" in df.columns else 0
     psc_target  = int((df["PSC from Target Country"] != "—").sum()) if "PSC from Target Country" in df.columns else 0
-    dir_target  = int((df["Director Nationality"] != "—").sum()) if "Director Nationality" in df.columns else 0
+    dir_target  = int((df["Director from Target Country"] != "—").sum()) if "Director from Target Country" in df.columns else 0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Companies screened",         len(df))
@@ -615,11 +615,10 @@ def render_kpis(df: pd.DataFrame) -> None:
 
 _TABLE_COLS = [
     "Company Name",
-    "SIC Codes",
-    "Director Nationality",
+    "Director from Target Country",
     "Owned by Another Company",
     "PSC from Target Country",
-    "Publishable",
+    "SIC Codes",
 ]
 
 
@@ -650,9 +649,9 @@ def render_results(df: pd.DataFrame) -> None:
         view = view[view["Owned by Another Company"] == "No"]
 
     if show_target == "Target nationality present":
-        view = view[(view["PSC from Target Country"] != "—") | (view["Director Nationality"] != "—")]
+        view = view[(view["PSC from Target Country"] != "—") | (view["Director from Target Country"] != "—")]
     elif show_target == "No target nationality":
-        view = view[(view["PSC from Target Country"] == "—") & (view["Director Nationality"] == "—")]
+        view = view[(view["PSC from Target Country"] == "—") & (view["Director from Target Country"] == "—")]
 
     cols = [c for c in _TABLE_COLS if c in view.columns]
     st.dataframe(view[cols], use_container_width=True, height=560)
