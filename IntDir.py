@@ -513,6 +513,31 @@ def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -
     load_results_csv.clear()
 
 
+def clear_today_results(run_date: str, screening_mode: str, selected_user: str) -> None:
+    snapshot_path, seen_path = get_store_paths(run_date, screening_mode)
+    lead_path = lead_file_path(selected_user, run_date, screening_mode)
+
+    for path in [snapshot_path, seen_path, lead_path]:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    load_results_csv.clear()
+    load_leads_csv.clear()
+    fetch_companies_incorporated_today.clear()
+    fetch_director_screening_cached.clear()
+    fetch_psc_screening_cached.clear()
+
+    st.session_state["latest_df"] = pd.DataFrame(columns=RESULT_COLUMNS)
+    st.session_state["sorted_df"] = pd.DataFrame(columns=RESULT_COLUMNS)
+    st.session_state["new_df"] = pd.DataFrame(columns=RESULT_COLUMNS)
+    st.session_state["last_refresh"] = "Cleared - waiting for refresh"
+
+    st.rerun()
+
+
 def add_company_to_leads(
     person: str,
     run_date: str,
@@ -828,6 +853,10 @@ def main() -> None:
 
     st.sidebar.caption(f"Current mode: {labels['source_name']}")
     refresh = st.sidebar.button("Refresh now", type="primary")
+
+    st.sidebar.subheader("Reset")
+    if st.sidebar.button("Clear today's results for this mode", type="secondary"):
+        clear_today_results(run_date, screening_mode, selected_user)
 
     if refresh or not snapshot_path.exists():
         with st.spinner(f"Refreshing Companies House data using {labels['source_name']}..."):
