@@ -634,7 +634,18 @@ def render_results(df: pd.DataFrame) -> None:
         st.info("No results yet — set an incorporation date and press **Run new search**.")
         return
 
-    st.subheader(f"Results — {len(df)} companies")
+    view = df.copy()
+    for col, default in {
+        "Publishable": "❌ No",
+        "Owned by Another Company": "No",
+        "PSC from Target Country": "—",
+        "Director Nationality": "—",
+        "Director Residency": "—",
+    }.items():
+        if col not in view.columns:
+            view[col] = default
+
+    st.subheader(f"Results — {len(view)} companies")
 
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
@@ -644,30 +655,36 @@ def render_results(df: pd.DataFrame) -> None:
     with fc3:
         show_target = st.selectbox("PSC / Director nationality", ["All", "Target nationality present", "No target nationality"])
 
-    view = df.copy()
     if show_pub == "Publishable only":
         view = view[view["Publishable"] == "✅ Yes"]
     elif show_pub == "Not publishable only":
         view = view[view["Publishable"] == "❌ No"]
 
     if show_owned == "Owned by company only":
-        view = view[view["Owned by Another Company"].str.startswith("👨")]
+        view = view[view["Owned by Another Company"].astype(str).str.startswith("👨", na=False)]
     elif show_owned == "Not owned by company":
         view = view[view["Owned by Another Company"] == "No"]
 
     if show_target == "Target nationality present":
-        view = view[(view["PSC from Target Country"] != "—") | (view["Director Nationality"] != "—") | (view["Director Residency"] != "—")]
+        view = view[
+            (view["PSC from Target Country"] != "—")
+            | (view["Director Nationality"] != "—")
+            | (view["Director Residency"] != "—")
+        ]
     elif show_target == "No target nationality":
-        view = view[(view["PSC from Target Country"] == "—") & (view["Director Nationality"] == "—") & (view["Director Residency"] == "—")]
+        view = view[
+            (view["PSC from Target Country"] == "—")
+            & (view["Director Nationality"] == "—")
+            & (view["Director Residency"] == "—")
+        ]
 
     cols = [c for c in _TABLE_COLS if c in view.columns]
     st.dataframe(view[cols], use_container_width=True, height=560)
     st.caption(f"Showing {len(view)} of {len(df)} companies after filters.")
 
-    # CSV export includes all fields including hidden reference columns
     st.download_button(
         "⬇ Download as CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
+        data=view.to_csv(index=False).encode("utf-8"),
         file_name="ch_screening_results.csv",
         mime="text/csv",
     )
