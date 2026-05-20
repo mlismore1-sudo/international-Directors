@@ -1,225 +1,539 @@
+"""
+Companies House Screening Tool
+================================
+Run:     streamlit run companies_house_screening.py
+Env var: COMPANIES_HOUSE_API_KEY=<your key>
+Install: pip install streamlit requests pandas
+"""
+
+import os
 import re
+import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
-TARGET_COUNTRIES = {
-    "nigeria",
-    "pakistan",
-    "turkey",
-    "india",
-    "china",
-    "russia",
+import pandas as pd
+import requests
+
+# ── Streamlit is imported last so nothing above triggers Streamlit internals ──
+import streamlit as st
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG  (must be the very first Streamlit call)
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="CH Screening Tool",
+    page_icon="🏢",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS  (pure Python – no Streamlit calls here)
+# ─────────────────────────────────────────────────────────────────────────────
+COMPANIES_HOUSE_BASE = "https://api.company-information.service.gov.uk"
+REQUEST_TIMEOUT      = 20
+CACHE_TTL_SECONDS    = 43_200   # 12 hours
+
+_DEFAULT_TARGET_COUNTRIES: Set[str] = {
+    "nigeria", "pakistan", "turkey",
+    "india", "china", "russia",
     "united arab emirates",
 }
 
-PRIORITY_EXCEPTION_COUNTRIES = {"nigeria", "pakistan", "turkey"}
-ALWAYS_PUBLISH_SICS = {"62012", "72110"}
+_PRIORITY_EXCEPTION_COUNTRIES: Set[str] = {"nigeria", "pakistan", "turkey"}
+_ALWAYS_PUBLISH_SICS: Set[str]           = {"62012", "72110"}
 
-COUNTRY_ALIASES = {
-    "turkiye": "turkey",
-    "türkiye": "turkey",
-    "uae": "united arab emirates",
-    "u.a.e.": "united arab emirates",
-    "england": "united kingdom",
-    "scotland": "united kingdom",
-    "wales": "united kingdom",
+_COUNTRY_ALIASES: Dict[str, str] = {
+    "turkiye":          "turkey",
+    "türkiye":          "turkey",
+    "uae":              "united arab emirates",
+    "u.a.e.":           "united arab emirates",
+    "england":          "united kingdom",
+    "scotland":         "united kingdom",
+    "wales":            "united kingdom",
     "northern ireland": "united kingdom",
 }
 
+_LEGAL_KIND_MARKERS: List[str] = [
+    "corporate-entity", "legal-person", "firm", "super-secure",
+]
 
-def normalize_country(value: Optional[str]) -> str:
+_CORPORATE_NAME_MARKERS: List[str] = [
+    " ltd", " limited", " llp", " plc", " inc",
+    " gmbh", " sarl", " bv", " ag", " oy", " spa",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE  (called once inside main() before anything else runs)
+# ─────────────────────────────────────────────────────────────────────────────
+def _init_session() -> None:
+    defaults: Dict[str, Any] = {
+        "company_cache":           {},
+        "refresh_token":           0,
+        "results_df":              pd.DataFrame(),
+        "last_refreshed_at":       None,
+        "active_target_countries": _DEFAULT_TARGET_COUNTRIES.copy(),
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COUNTRY NORMALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+def _normalise(value: Optional[str]) -> str:
     if not value:
         return ""
     cleaned = re.sub(r"\s+", " ", str(value).strip().lower())
-    return COUNTRY_ALIASES.get(cleaned, cleaned)
+    return _COUNTRY_ALIASES.get(cleaned, cleaned)
 
 
-NORMALIZED_TARGET_COUNTRIES: Set[str] = {normalize_country(c) for c in TARGET_COUNTRIES}
-NORMALIZED_PRIORITY_COUNTRIES: Set[str] = {normalize_country(c) for c in PRIORITY_EXCEPTION_COUNTRIES}
+def _norm_set(countries: Set[str]) -> Set[str]:
+    return {_normalise(c) for c in countries}
 
 
-def is_target_country(value: Optional[str]) -> bool:
-    return normalize_country(value) in NORMALIZED_TARGET_COUNTRIES
+def _is_target(value: Optional[str]) -> bool:
+    targets = _norm_set(st.session_state.get("active_target_countries", _DEFAULT_TARGET_COUNTRIES))
+    return _normalise(value) in targets
 
 
+def _is_priority(value: Optional[str]) -> bool:
+    return _normalise(value) in _norm_set(_PRIORITY_EXCEPTION_COUNTRIES)
 
-def is_priority_country(value: Optional[str]) -> bool:
-    return normalize_country(value) in NORMALIZED_PRIORITY_COUNTRIES
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPANIES HOUSE API HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _session(api_key: str) -> requests.Session:
+    s = requests.Session()
+    s.auth = (api_key, "")
+    s.headers.update({"Accept": "application/json"})
+    return s
 
 
+def _get(api_key: str, url: str, params: Optional[Dict] = None) -> Dict:
+    resp = _session(api_key).get(url, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json() if resp.text.strip() else {}
 
-def psc_record_is_legal_entity(psc: Dict[str, Any]) -> bool:
+
+def _paginated(api_key: str, url: str, items_key: str = "items", page: int = 100) -> List[Dict]:
+    out: List[Dict] = []
+    start = 0
+    while True:
+        data  = _get(api_key, url, {"items_per_page": page, "start_index": start})
+        batch = data.get(items_key) or []
+        out.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+        time.sleep(0.05)
+    return out
+
+
+def api_search(api_key: str, query: str, max_results: int) -> List[Dict]:
+    data = _get(
+        api_key,
+        f"{COMPANIES_HOUSE_BASE}/search/companies",
+        {"q": query, "items_per_page": min(max_results, 100)},
+    )
+    return data.get("items") or []
+
+
+def api_profile(api_key: str, cn: str) -> Dict:
+    return _get(api_key, f"{COMPANIES_HOUSE_BASE}/company/{cn}")
+
+
+def api_officers(api_key: str, cn: str) -> List[Dict]:
+    return _paginated(api_key, f"{COMPANIES_HOUSE_BASE}/company/{cn}/officers")
+
+
+def api_pscs(api_key: str, cn: str) -> List[Dict]:
+    return _paginated(
+        api_key,
+        f"{COMPANIES_HOUSE_BASE}/company/{cn}/persons-with-significant-control",
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCREENING LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+def _psc_is_legal_entity(psc: Dict) -> bool:
     kind = str(psc.get("kind", "")).lower()
     name = str(psc.get("name", "")).strip()
-    natures = [str(x).lower() for x in psc.get("natures_of_control", [])]
-
-    legal_kind_markers = [
-        "corporate-entity",
-        "legal-person",
-        "firm",
-        "super-secure",
-    ]
-    if any(marker in kind for marker in legal_kind_markers):
+    if any(m in kind for m in _LEGAL_KIND_MARKERS):
         return True
-
-    corporate_name_markers = [" ltd", " limited", " llp", " plc", " inc", " gmbh", " sarl", " bv"]
-    if any(marker in f" {name.lower()}" for marker in corporate_name_markers):
+    if any(m in f" {name.lower()}" for m in _CORPORATE_NAME_MARKERS):
         return True
+    natures = [str(x).lower() for x in psc.get("natures_of_control") or []]
+    return (
+        any("ownership-of-shares" in n or "voting-rights" in n for n in natures)
+        and not psc.get("nationality")
+    )
 
-    return any("ownership-of-shares" in nature or "voting-rights" in nature for nature in natures) and not psc.get("nationality")
 
+def screen_pscs(pscs: List[Dict]) -> Dict:
+    legal_flag     = False
+    nat_flag       = False
+    legal_names:   List[str] = []
+    nationalities: List[str] = []
+    priority:      Optional[str] = None
 
-
-def summarise_psc_flags(psc_items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    legal_entity_flag = False
-    target_nationality_flag = False
-    matched_psc_nationalities: List[str] = []
-    priority_match: Optional[str] = None
-
-    for psc in psc_items:
-        if psc_record_is_legal_entity(psc):
-            legal_entity_flag = True
-
-        nationality = psc.get("nationality")
-        if is_target_country(nationality):
-            target_nationality_flag = True
-            matched_psc_nationalities.append(str(nationality))
-            if is_priority_country(nationality) and priority_match is None:
-                priority_match = str(nationality)
+    for psc in pscs:
+        if _psc_is_legal_entity(psc):
+            legal_flag = True
+            legal_names.append(str(psc.get("name", "Unknown PSC")))
+        nat = psc.get("nationality")
+        if _is_target(nat):
+            nat_flag = True
+            nationalities.append(str(nat))
+            if _is_priority(nat) and not priority:
+                priority = str(nat)
 
     return {
-        "psc_legal_entity_flag": legal_entity_flag,
-        "psc_target_nationality_flag": target_nationality_flag,
-        "matched_psc_nationalities": matched_psc_nationalities,
-        "psc_priority_country": priority_match,
+        "psc_legal_entity_flag":     legal_flag,
+        "psc_legal_entity_names":    "; ".join(legal_names),
+        "psc_nationality_flag":      nat_flag,
+        "psc_matched_nationalities": "; ".join(nationalities),
+        "psc_priority_country":      priority,
     }
 
 
+def screen_officers(officers: List[Dict]) -> Dict:
+    names:       List[str] = []
+    residencies: List[str] = []
+    priority:    Optional[str] = None
 
-def summarise_director_flags(officers: List[Dict[str, Any]]) -> Dict[str, Any]:
-    target_directors: List[str] = []
-    priority_match: Optional[str] = None
-
-    for officer in officers:
-        role = str(officer.get("officer_role", "")).lower()
-        if role != "director":
+    for o in officers:
+        if str(o.get("officer_role", "")).lower() != "director":
             continue
-
-        residence = officer.get("country_of_residence") or officer.get("residential_country")
-        if is_target_country(residence):
-            target_directors.append(f"{officer.get('name', 'Unknown')} ({residence})")
-            if is_priority_country(residence) and priority_match is None:
-                priority_match = str(residence)
+        res = o.get("country_of_residence") or o.get("usual_residential_country")
+        if _is_target(res):
+            names.append(str(o.get("name", "Unknown")))
+            residencies.append(str(res))
+            if _is_priority(res) and not priority:
+                priority = str(res)
 
     return {
-        "director_target_residency_flag": bool(target_directors),
-        "matched_director_residencies": target_directors,
-        "director_priority_country": priority_match,
+        "director_residency_flag":      bool(names),
+        "director_matched_names":       "; ".join(names),
+        "director_matched_residencies": "; ".join(residencies),
+        "director_priority_country":    priority,
     }
 
 
-
-def should_publish_company(company: Dict[str, Any], psc_flags: Dict[str, Any], director_flags: Dict[str, Any]) -> Dict[str, Any]:
-    sic_codes = {str(code) for code in company.get("sic_codes", []) if code}
-    in_always_publish_sic = bool(sic_codes & ALWAYS_PUBLISH_SICS)
-
-    priority_country = (
-        psc_flags.get("psc_priority_country")
-        or director_flags.get("director_priority_country")
+def decide_publish(profile: Dict, psc: Dict, officers: Dict) -> Dict:
+    sics           = {str(c) for c in (profile.get("sic_codes") or [])}
+    always_publish = bool(sics & _ALWAYS_PUBLISH_SICS)
+    priority       = psc.get("psc_priority_country") or officers.get("director_priority_country")
+    any_flag       = (
+        psc["psc_legal_entity_flag"]
+        or psc["psc_nationality_flag"]
+        or officers["director_residency_flag"]
     )
 
-    flagged = (
-        psc_flags["psc_legal_entity_flag"]
-        or psc_flags["psc_target_nationality_flag"]
-        or director_flags["director_target_residency_flag"]
-    )
-
-    if in_always_publish_sic and not priority_country:
+    if always_publish and not priority:
         return {
-            "should_publish": True,
-            "publish_reason": "SIC 62012/72110 retained and no Nigeria/Pakistan/Turkey exception matched",
-            "priority_exception_country_flag": False,
+            "should_publish":           True,
+            "publish_reason":           "SIC 62012/72110 retained — no priority-exception country",
+            "priority_exception":       False,
             "matched_priority_country": None,
         }
-
-    if priority_country:
+    if priority:
         return {
-            "should_publish": flagged,
-            "publish_reason": f"Priority exception country matched: {priority_country}",
-            "priority_exception_country_flag": True,
-            "matched_priority_country": priority_country,
+            "should_publish":           any_flag,
+            "publish_reason":           f"Priority exception country: {priority}",
+            "priority_exception":       True,
+            "matched_priority_country": priority,
         }
-
     return {
-        "should_publish": flagged,
-        "publish_reason": "Published because ownership/residency screening flagged the company" if flagged else "Not published because no screening rule matched",
-        "priority_exception_country_flag": False,
+        "should_publish":           any_flag,
+        "publish_reason":           "Screening rule matched" if any_flag else "No rule matched — not published",
+        "priority_exception":       False,
         "matched_priority_country": None,
     }
 
 
-
-def enrich_company_once(company_number: str, company_cache: Dict[str, Dict[str, Any]], refresh_token: int, fetch_company_profile, fetch_company_officers, fetch_company_psc) -> Dict[str, Any]:
-    cache_key = f"{company_number}:{refresh_token}"
-    if cache_key in company_cache:
-        return company_cache[cache_key]
-
-    profile = fetch_company_profile(company_number)
-    officers = fetch_company_officers(company_number)
-    psc_items = fetch_company_psc(company_number)
-
-    psc_flags = summarise_psc_flags(psc_items)
-    director_flags = summarise_director_flags(officers)
-    publish_flags = should_publish_company(profile, psc_flags, director_flags)
-
-    result = {
-        **profile,
-        **psc_flags,
-        **director_flags,
-        **publish_flags,
-        "company_number": company_number,
+def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
+    sics = profile.get("sic_codes") or []
+    addr = profile.get("registered_office_address") or {}
+    return {
+        "company_number":               cn,
+        "company_name":                 profile.get("company_name", ""),
+        "status":                       profile.get("company_status", ""),
+        "incorporated":                 profile.get("date_of_creation", ""),
+        "sic_codes":                    ", ".join(map(str, sics)),
+        "address":                      ", ".join(str(v) for v in addr.values() if v),
+        "psc_legal_entity_flag":        psc["psc_legal_entity_flag"],
+        "psc_legal_entity_names":       psc["psc_legal_entity_names"],
+        "psc_nationality_flag":         psc["psc_nationality_flag"],
+        "psc_matched_nationalities":    psc["psc_matched_nationalities"],
+        "director_residency_flag":      off["director_residency_flag"],
+        "director_matched_names":       off["director_matched_names"],
+        "director_matched_residencies": off["director_matched_residencies"],
+        "priority_exception":           pub["priority_exception"],
+        "matched_priority_country":     pub["matched_priority_country"] or "",
+        "should_publish":               pub["should_publish"],
+        "publish_reason":               pub["publish_reason"],
+        "ch_url":                       f"https://find-and-update.company-information.service.gov.uk/company/{cn}",
     }
-    company_cache[cache_key] = result
-    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE-GUARDED ENRICHMENT
+# ─────────────────────────────────────────────────────────────────────────────
+def enrich_one(api_key: str, cn: str) -> Dict:
+    cache = st.session_state.company_cache
+    token = st.session_state.refresh_token
+    entry = cache.get(cn)
+
+    if entry and entry.get("token") == token and (time.time() - entry["ts"]) < CACHE_TTL_SECONDS:
+        return entry["data"]
+
+    profile  = api_profile(api_key, cn)
+    officers = api_officers(api_key, cn)
+    pscs     = api_pscs(api_key, cn)
+
+    psc_flags = screen_pscs(pscs)
+    off_flags = screen_officers(officers)
+    pub_flags = decide_publish(profile, psc_flags, off_flags)
+    row       = build_row(cn, profile, psc_flags, off_flags, pub_flags)
+
+    cache[cn] = {"token": token, "ts": time.time(), "data": row}
+    return row
 
 
+def enrich_all(api_key: str, search_rows: List[Dict]) -> pd.DataFrame:
+    seen:   Set[str]  = set()
+    unique: List[str] = []
+    for r in search_rows:
+        cn = str(r.get("company_number", "")).strip()
+        if cn and cn not in seen:
+            seen.add(cn)
+            unique.append(cn)
 
-def process_companies(companies: List[Dict[str, Any]], company_cache: Dict[str, Dict[str, Any]], refresh_token: int, fetch_company_profile, fetch_company_officers, fetch_company_psc) -> List[Dict[str, Any]]:
-    seen: Set[str] = set()
-    output: List[Dict[str, Any]] = []
+    if not unique:
+        st.warning("No valid company numbers returned by search.")
+        return pd.DataFrame()
 
-    for company in companies:
-        company_number = str(company.get("company_number", "")).strip()
-        if not company_number or company_number in seen:
-            continue
-        seen.add(company_number)
+    total    = len(unique)
+    progress = st.progress(0)
+    status   = st.empty()
+    rows:    List[Dict] = []
 
-        enriched = enrich_company_once(
-            company_number=company_number,
-            company_cache=company_cache,
-            refresh_token=refresh_token,
-            fetch_company_profile=fetch_company_profile,
-            fetch_company_officers=fetch_company_officers,
-            fetch_company_psc=fetch_company_psc,
+    for idx, cn in enumerate(unique, 1):
+        status.caption(f"Enriching {idx} / {total} — {cn}")
+        try:
+            rows.append(enrich_one(api_key, cn))
+        except requests.HTTPError as exc:
+            rows.append({
+                "company_number": cn, "company_name": "", "status": "",
+                "incorporated": "", "sic_codes": "", "address": "",
+                "psc_legal_entity_flag": False, "psc_legal_entity_names": "",
+                "psc_nationality_flag": False, "psc_matched_nationalities": "",
+                "director_residency_flag": False, "director_matched_names": "",
+                "director_matched_residencies": "", "priority_exception": False,
+                "matched_priority_country": "", "should_publish": False,
+                "publish_reason": f"API error: {exc}",
+                "ch_url": f"https://find-and-update.company-information.service.gov.uk/company/{cn}",
+            })
+        progress.progress(idx / total)
+
+    progress.empty()
+    status.empty()
+    return pd.DataFrame(rows)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────────
+def render_sidebar() -> Dict[str, Any]:
+    with st.sidebar:
+        st.header("🔍 Search")
+        query       = st.text_input("Company name or keyword", value="software development")
+        max_results = st.slider("Max results to enrich", 10, 100, 30, step=10)
+
+        st.header("🌍 Target countries")
+        all_country_opts = sorted(
+            _DEFAULT_TARGET_COUNTRIES | {"united kingdom", "france", "germany", "spain"}
         )
-        output.append(enriched)
+        selected_countries = st.multiselect(
+            "Countries",
+            options=all_country_opts,
+            default=sorted(_DEFAULT_TARGET_COUNTRIES),
+            help="PSC nationality and director country of residence are matched against these.",
+        )
 
-    return output
+        st.header("🏷 SIC codes")
+        sic_filter = st.multiselect(
+            "Restrict search to SIC codes",
+            options=["62012", "72110", "62020", "62090", "63110"],
+            default=["62012", "72110"],
+            help="62012 and 72110 are always published unless a priority-exception country is found.",
+        )
+
+        st.divider()
+        col1, col2 = st.columns(2)
+        run     = col1.button("Search",  use_container_width=True, type="primary")
+        refresh = col2.button("Refresh", use_container_width=True,
+                              help="Bumps the cache token so all companies are re-fetched on next search.")
+        if refresh:
+            st.session_state.refresh_token     += 1
+            st.session_state.last_refreshed_at  = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
+            st.success(f"Cache cleared — token is now {st.session_state.refresh_token}.")
+
+        st.divider()
+        st.caption(
+            f"Cache token: `{st.session_state.refresh_token}`  \n"
+            f"Last manual refresh: {st.session_state.last_refreshed_at or 'never this session'}"
+        )
+
+    return {
+        "query":              query,
+        "max_results":        max_results,
+        "selected_countries": set(selected_countries),
+        "sic_filter":         set(sic_filter),
+        "run":                run,
+    }
 
 
-# Streamlit usage pattern:
-# if "company_cache" not in st.session_state:
-#     st.session_state.company_cache = {}
-# if "refresh_token" not in st.session_state:
-#     st.session_state.refresh_token = 0
-#
-# if st.button("Manual refresh"):
-#     st.session_state.refresh_token += 1
-#
-# results = process_companies(
-#     companies=search_results,
-#     company_cache=st.session_state.company_cache,
-#     refresh_token=st.session_state.refresh_token,
-#     fetch_company_profile=fetch_company_profile,
-#     fetch_company_officers=fetch_company_officers,
-#     fetch_company_psc=fetch_company_psc,
-# )
+def render_kpis(df: pd.DataFrame) -> None:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    def _n(col: str) -> int:
+        return int(df[col].sum()) if (not df.empty and col in df.columns) else 0
+    c1.metric("Companies",               len(df))
+    c2.metric("PSC legal entities",      _n("psc_legal_entity_flag"))
+    c3.metric("PSC nationality flags",   _n("psc_nationality_flag"))
+    c4.metric("Director residency flags", _n("director_residency_flag"))
+    c5.metric("Publishable",             _n("should_publish"))
+
+
+_DISPLAY_COLS = [
+    "company_name", "company_number", "sic_codes", "status",
+    "psc_legal_entity_flag", "psc_legal_entity_names",
+    "psc_nationality_flag",  "psc_matched_nationalities",
+    "director_residency_flag", "director_matched_names", "director_matched_residencies",
+    "priority_exception", "matched_priority_country",
+    "should_publish", "publish_reason", "ch_url",
+]
+
+
+def _tab_df(df: pd.DataFrame) -> None:
+    cols = [c for c in _DISPLAY_COLS if c in df.columns]
+    st.dataframe(df[cols], use_container_width=True, height=480)
+
+
+def render_results(df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info("No results yet — enter a search term and press **Search**.")
+        return
+
+    n_pub  = int(df["should_publish"].sum())     if "should_publish"     in df.columns else 0
+    n_pri  = int(df["priority_exception"].sum()) if "priority_exception" in df.columns else 0
+    mask   = (
+        ~df.get("psc_legal_entity_flag",  pd.Series(False, index=df.index)).astype(bool)
+        & ~df.get("psc_nationality_flag", pd.Series(False, index=df.index)).astype(bool)
+        & ~df.get("director_residency_flag", pd.Series(False, index=df.index)).astype(bool)
+    )
+    n_none = int(mask.sum())
+
+    t_all, t_pub, t_pri, t_none = st.tabs([
+        f"All ({len(df)})",
+        f"Publishable ({n_pub})",
+        f"Priority exceptions ({n_pri})",
+        f"Unflagged ({n_none})",
+    ])
+
+    with t_all:
+        _tab_df(df)
+    with t_pub:
+        sub = df[df["should_publish"]] if "should_publish" in df.columns else df.iloc[0:0]
+        _tab_df(sub) if not sub.empty else st.info("No publishable companies.")
+    with t_pri:
+        sub = df[df["priority_exception"]] if "priority_exception" in df.columns else df.iloc[0:0]
+        _tab_df(sub) if not sub.empty else st.info("No priority-exception companies.")
+    with t_none:
+        sub = df[mask]
+        _tab_df(sub) if not sub.empty else st.info("All companies have at least one flag.")
+
+    st.download_button(
+        "⬇ Download full results as CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="ch_screening_results.csv",
+        mime="text/csv",
+    )
+
+
+def render_rules() -> None:
+    with st.expander("📋 Active screening rules"):
+        st.markdown("""
+| Rule | Behaviour |
+|---|---|
+| PSC tab contains a legal entity | `psc_legal_entity_flag = True` |
+| PSC nationality matches a target country | `psc_nationality_flag = True` |
+| Any director is resident in a target country | `director_residency_flag = True` |
+| SIC 62012 or 72110, no priority-exception country | Always published regardless of flags |
+| SIC 62012 or 72110 **and** Nigeria / Pakistan / Turkey detected | Published only if a flag is also set |
+| No SIC match and no flags | Not published |
+| Same company number in results twice | Processed once — duplicate skipped |
+| Manual refresh not triggered | Cached enrichment reused for every lookup |
+        """)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    _init_session()
+
+    st.title("🏢 Companies House Screening Tool")
+    st.caption(
+        "Flags PSC legal entities · PSC nationality · director residency  |  "
+        "SIC 62012 and 72110 always published unless Nigeria, Pakistan, or Turkey is detected."
+    )
+
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        st.error(
+            "**API key missing.**\n\n"
+            "Set your Companies House key before launching:\n"
+            "```\nexport COMPANIES_HOUSE_API_KEY=your_key_here\n"
+            "streamlit run companies_house_screening.py\n```"
+        )
+        st.stop()
+
+    controls = render_sidebar()
+    st.session_state.active_target_countries = controls["selected_countries"]
+
+    st.markdown(
+        f"**Active filters** — "
+        f"Query: `{controls['query'] or '—'}` · "
+        f"SICs: `{', '.join(sorted(controls['sic_filter'])) or 'all'}` · "
+        f"Target countries: `{', '.join(sorted(str(c) for c in controls['selected_countries'])) or 'none'}`"
+    )
+    st.divider()
+
+    if controls["run"]:
+        with st.spinner("Searching Companies House…"):
+            try:
+                raw = api_search(api_key, controls["query"], controls["max_results"])
+            except requests.HTTPError as exc:
+                st.error(f"Search request failed: {exc}")
+                st.stop()
+
+        if not raw:
+            st.warning("No companies returned. Try a broader search term.")
+        else:
+            if controls["sic_filter"]:
+                filtered = [r for r in raw if any(s in str(r) for s in controls["sic_filter"])]
+                if not filtered:
+                    filtered = raw
+                    st.info("SIC filter matched no snippets — showing all returned companies.")
+            else:
+                filtered = raw
+
+            st.session_state.results_df = enrich_all(api_key, filtered)
+
+    render_kpis(st.session_state.results_df)
+    render_results(st.session_state.results_df)
+    render_rules()
+
+
+if __name__ == "__main__":
+    main()
