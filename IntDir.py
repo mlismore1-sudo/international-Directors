@@ -72,6 +72,8 @@ ACCEPTED_COMPANY_TYPES: Set[str] = {
     "limited-liability-partnership",
 }
 
+DIRECTOR_ROLES: Set[str] = {"director", "llp-member"}
+
 _COUNTRY_ALIASES: Dict[str, str] = {
     "usa": "united states",
     "u.s.a.": "united states",
@@ -87,12 +89,17 @@ _COUNTRY_ALIASES: Dict[str, str] = {
     "people's republic of china": "china",
 }
 
-_LEGAL_KIND_MARKERS = [
+_LEGAL_KIND_MARKERS = {
+    "corporate-entity-person-with-significant-control",
+    "legal-person-with-significant-control",
+    "corporate-entity-beneficial-owner",
+    "legal-person-beneficial-owner",
+    "firm-beneficial-owner",
     "corporate-entity",
     "legal-person",
     "firm",
-    "super-secure",
-]
+    "super-secure-person-with-significant-control",
+}
 
 _CORPORATE_NAME_MARKERS = [
     " ltd", " limited", " llp", " plc", " inc", " gmbh", " sarl", " bv",
@@ -177,7 +184,6 @@ def _get_http_session(api_key: str) -> requests.Session:
         s = requests.Session()
         s.auth = (api_key, "")
         s.headers.update({"Accept": "application/json"})
-
         retry = Retry(
             total=3,
             backoff_factor=0.3,
@@ -187,15 +193,11 @@ def _get_http_session(api_key: str) -> requests.Session:
         adapter = HTTPAdapter(max_retries=retry)
         s.mount("https://", adapter)
         HTTP_SESSIONS[api_key] = s
-
     return HTTP_SESSIONS[api_key]
 
 
 def _init_session() -> None:
-    defaults = {
-        "refresh_token": 0,
-        "last_refreshed_at": None,
-    }
+    defaults = {"refresh_token": 0, "last_refreshed_at": None}
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -205,7 +207,6 @@ def _init_session() -> None:
 
     if "results_df" not in st.session_state:
         loaded = _load_saved_results()
-
         required_cols = {
             "Timestamp": "",
             "Company Name": "",
@@ -218,7 +219,6 @@ def _init_session() -> None:
             "_added_at": "",
             "_cache_token": 0,
         }
-
         for col, default in required_cols.items():
             if col not in loaded.columns:
                 loaded[col] = default
@@ -234,6 +234,8 @@ def _normalise(value: Optional[str]) -> str:
         return ""
     cleaned = re.sub(r"\s+", " ", str(value).strip().lower())
     cleaned = cleaned.replace("-", " ")
+    cleaned = cleaned.replace(",", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return _COUNTRY_ALIASES.get(cleaned, cleaned)
 
 
@@ -241,7 +243,15 @@ _NORM_TARGETS = {_normalise(c) for c in TARGET_COUNTRIES}
 
 
 def _is_target(value: Optional[str]) -> bool:
-    return _normalise(value) in _NORM_TARGETS
+    norm = _normalise(value)
+    if not norm:
+        return False
+    if norm in _NORM_TARGETS:
+        return True
+    for target in _NORM_TARGETS:
+        if target in norm or norm in target:
+            return True
+    return False
 
 
 def _get(url: str, params: Optional[Dict] = None) -> Dict:
@@ -254,17 +264,13 @@ def _get(url: str, params: Optional[Dict] = None) -> Dict:
 def _paginated(url: str, items_key: str = "items", page: int = 100) -> List[Dict]:
     out: List[Dict] = []
     start = 0
-
     while True:
         data = _get(url, {"items_per_page": page, "start_index": start})
         batch = data.get(items_key) or []
         out.extend(batch)
-
         if len(batch) < page:
             break
-
         start += page
-
     return out
 
 
@@ -275,7 +281,6 @@ def api_search_by_date(incorporated_on: date) -> List[Dict]:
     def _fetch_sic(sic: str) -> List[Dict]:
         results: List[Dict] = []
         start = 0
-
         while True:
             try:
                 data = _get(
@@ -297,16 +302,10 @@ def api_search_by_date(incorporated_on: date) -> List[Dict]:
 
             batch = data.get("items") or []
             results.extend(batch)
-
-            total = data.get("hits")
-            if total is None:
-                total = len(results)
-
+            total = data.get("hits", len(results))
             start += len(batch)
-
             if not batch or start >= total:
                 break
-
         return results
 
     with ThreadPoolExecutor(max_workers=5) as pool:
@@ -333,11 +332,11 @@ def api_pscs(cn: str) -> List[Dict]:
 
 
 def _psc_is_legal_entity(psc: Dict) -> bool:
-    kind = str(psc.get("kind", "")).lower()
+    kind = str(psc.get("kind", "")).lower().strip()
     name = str(psc.get("name", "")).strip().lower()
     identification = psc.get("identification") or {}
 
-    if any(marker in kind for marker in _LEGAL_KIND_MARKERS):
+    if kind in _LEGAL_KIND_MARKERS:
         return True
 
     if any(marker in f" {name}" for marker in _CORPORATE_NAME_MARKERS):
@@ -354,11 +353,21 @@ def screen_pscs(pscs: List[Dict]) -> Dict:
     psc_target_country = False
 
     for psc in pscs:
+        if psc.get("ceased_on"):
+            continue
+
         if _psc_is_legal_entity(psc):
             owned_by_company = True
 
-        nationality = psc.get("nationality")
-        if _is_target(nationality):
+        if _is_target(psc.get("nationality")):
+            psc_target_country = True
+
+        identification = psc.get("identification") or {}
+        if _is_target(identification.get("country_registered")):
+            psc_target_country = True
+        if _is_target(identification.get("place_registered")):
+            psc_target_country = True
+        if _is_target(psc.get("country_of_residence")):
             psc_target_country = True
 
     return {
@@ -371,7 +380,11 @@ def screen_officers(officers: List[Dict]) -> Dict:
     director_target_residency = False
 
     for officer in officers:
-        if str(officer.get("officer_role", "")).lower() != "director":
+        if officer.get("resigned_on"):
+            continue
+
+        role = str(officer.get("officer_role", "")).lower().strip()
+        if role not in DIRECTOR_ROLES:
             continue
 
         residence = officer.get("country_of_residence") or officer.get("usual_residential_country")
@@ -399,7 +412,7 @@ def build_reason(psc: Dict, off: Dict) -> str:
         reasons.append("🌍 Director resident in target country")
 
     if psc["psc_target_country"]:
-        reasons.append("🌍 PSC nationality in target country")
+        reasons.append("🌍 PSC country / nationality match")
 
     if psc["owned_by_company"]:
         reasons.append("👨‍👧 PSC is another company")
@@ -408,18 +421,15 @@ def build_reason(psc: Dict, off: Dict) -> str:
 
 
 def match_sic_label(sics: Set[str]) -> str:
-    hits = sorted(sics & TARGET_SICS)
-    return ", ".join(hits)
+    return ", ".join(sorted(sics & TARGET_SICS))
 
 
 def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, sics: Set[str]) -> Optional[Dict]:
-    flagged = is_flagged_company(psc, off)
-    if not flagged:
+    if not is_flagged_company(psc, off):
         return None
 
     matched_target_sics = sics & TARGET_SICS
     is_tech_biotech = bool(matched_target_sics & TECH_BIOTECH_SICS)
-
     now_utc = datetime.utcnow()
 
     return {
@@ -467,7 +477,6 @@ def enrich_one(cn: str) -> Optional[Dict]:
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_officers = pool.submit(api_officers, cn)
         f_pscs = pool.submit(api_pscs, cn)
-
         officers = f_officers.result()
         pscs = f_pscs.result()
 
@@ -516,11 +525,9 @@ def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
 
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(enrich_one, cn): cn for cn in to_fetch}
-
             for idx, future in enumerate(as_completed(futures), start=1):
                 progress.progress(idx / total)
                 status_el.caption(f"Checking {idx} / {total} companies…")
-
                 try:
                     row = future.result()
                     if row:
@@ -532,10 +539,8 @@ def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
         status_el.empty()
 
     df = pd.DataFrame(cached_rows + new_rows)
-
     if not df.empty and "_added_at" in df.columns:
         df = df.sort_values("_added_at", ascending=False).reset_index(drop=True)
-
     return df
 
 
@@ -566,20 +571,14 @@ def render_sidebar() -> Dict[str, Any]:
 
         if clear:
             st.session_state.results_df = pd.DataFrame()
-
             if RESULTS_FILE.exists():
                 RESULTS_FILE.unlink()
-
             for f in DISK_CACHE_DIR.glob("*.json"):
                 f.unlink()
-
             st.session_state.disk_cache = {}
             st.success("Saved results and cache cleared.")
 
-    return {
-        "incorporated_from": incorporated_from,
-        "run": run,
-    }
+    return {"incorporated_from": incorporated_from, "run": run}
 
 
 def render_tables(df: pd.DataFrame) -> None:
@@ -620,7 +619,7 @@ def main() -> None:
 
     st.title("🏢 Companies House Screening Tool")
     st.caption(
-        "Flags companies in the selected SIC codes where a target-country director, target-nationality PSC, or corporate PSC is found."
+        "Flags companies in the selected SIC codes where a target-country director, target-country PSC, or corporate PSC is found."
     )
 
     controls = render_sidebar()
@@ -643,10 +642,9 @@ def main() -> None:
             new_df = enrich_all(raw)
 
             if new_df.empty:
-                st.warning("No companies matched the director / PSC flag criteria.")
+                st.warning("No companies matched the active director / PSC flag criteria.")
             else:
                 existing = st.session_state.results_df
-
                 if not existing.empty and "_company_number" in existing.columns:
                     combined = pd.concat([existing, new_df], ignore_index=True)
                     combined = combined.sort_values("_added_at", ascending=False)
