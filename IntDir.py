@@ -32,6 +32,8 @@ FLAGGED_COUNTRY_ALIASES = {
     "portugal": "Portugal",
     "usa": "United States",
     "u.s.a.": "United States",
+    "u.s.": "United States",
+    "u s a": "United States",
     "united states of america": "United States",
     "united states": "United States",
     "us": "United States",
@@ -44,6 +46,7 @@ FLAGGED_COUNTRY_ALIASES = {
     "denmark": "Denmark",
     "belgium": "Belgium",
     "netherlands": "Netherlands",
+    "the netherlands": "Netherlands",
     "poland": "Poland",
     "italy": "Italy",
     "austria": "Austria",
@@ -66,6 +69,7 @@ RESULT_COLUMNS = [
     "uk_director",
     "time_added_to_table",
     "pull_order",
+    "psc_target_country_match",
 ]
 
 LEAD_COLUMNS = [
@@ -75,6 +79,7 @@ LEAD_COLUMNS = [
     "director_countries_flagged",
     "matched_director_countries",
     "uk_director",
+    "psc_target_country_match",
     "added_by",
     "added_at",
 ]
@@ -141,25 +146,21 @@ def is_uk_country(value: Optional[str]) -> bool:
 def get_mode_labels(screening_mode: str) -> Dict[str, str]:
     if screening_mode == "PSC":
         return {
-            "flag_col": "director_countries_flagged",
-            "match_col": "matched_director_countries",
-            "uk_col": "uk_director",
             "source_name": "Persons with Significant Control",
             "short_source_name": "PSC",
             "uk_label": "UK PSC",
             "flag_label": "PSC Countries Flagged",
             "match_label": "Matched PSC Countries",
+            "target_highlight_label": "PSC In Target Country",
         }
 
     return {
-        "flag_col": "director_countries_flagged",
-        "match_col": "matched_director_countries",
-        "uk_col": "uk_director",
         "source_name": "Directors",
         "short_source_name": "Director",
         "uk_label": "UK Director",
         "flag_label": "Director Countries Flagged",
         "match_label": "Matched Director Countries",
+        "target_highlight_label": "PSC In Target Country",
     }
 
 
@@ -257,6 +258,7 @@ def fetch_companies_incorporated_today(api_keys_tuple: tuple[str, ...], run_date
                 "uk_director": "No",
                 "time_added_to_table": timestamp,
                 "pull_order": pull_counter,
+                "psc_target_country_match": "No",
             })
             pull_counter += 1
 
@@ -278,7 +280,7 @@ def fetch_companies_incorporated_today(api_keys_tuple: tuple[str, ...], run_date
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str]:
+def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str, str]:
     api_keys = list(api_keys_tuple)
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
     start_index = 0
@@ -301,7 +303,7 @@ def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[s
             )
 
             if response.status_code == 404:
-                return "No", "", "No"
+                return "No", "", "No", "No"
 
             payload = response.json()
             items = payload.get("items", []) or []
@@ -326,25 +328,26 @@ def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[s
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status in (400, 403, 404):
-                return "No", "", "No"
+                return "No", "", "No", "No"
             raise
 
         except requests.RequestException:
-            return "No", "", "No"
+            return "No", "", "No", "No"
 
     if matched_countries:
-        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_director else "No"
-    return "No", "", "Yes" if has_uk_director else "No"
+        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_director else "No", "No"
+    return "No", "", "Yes" if has_uk_director else "No", "No"
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_psc_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str]:
+def fetch_psc_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str, str]:
     api_keys = list(api_keys_tuple)
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/persons-with-significant-control"
     start_index = 0
     items_per_page = 100
     matched_countries = set()
     has_uk_psc = False
+    psc_target_country_match = False
 
     while True:
         params = {
@@ -362,21 +365,45 @@ def fetch_psc_screening_cached(company_number: str, api_keys_tuple: tuple[str, .
             )
 
             if response.status_code == 404:
-                return "No", "", "No"
+                return "No", "", "No", "No"
 
             payload = response.json()
             items = payload.get("items", []) or []
 
             for psc in items:
-                if psc.get("ceased"):
+                if psc.get("ceased") or psc.get("ceased_on"):
                     continue
 
-                country_of_residence = psc.get("country_of_residence", "")
-                normalized_country = normalize_country(country_of_residence)
-                if normalized_country:
-                    matched_countries.add(normalized_country)
-                if is_uk_country(country_of_residence):
-                    has_uk_psc = True
+                kind = str(psc.get("kind", "")).strip().lower()
+                candidate_countries = []
+
+                if kind == "individual-person-with-significant-control":
+                    candidate_countries.extend([
+                        psc.get("country_of_residence", ""),
+                        (psc.get("address") or {}).get("country", ""),
+                    ])
+                elif kind == "corporate-entity-person-with-significant-control":
+                    identification = psc.get("identification", {}) or {}
+                    candidate_countries.extend([
+                        identification.get("country_registered", ""),
+                        (psc.get("address") or {}).get("country", ""),
+                    ])
+                elif kind == "legal-person-with-significant-control":
+                    identification = psc.get("identification", {}) or {}
+                    candidate_countries.extend([
+                        identification.get("country_registered", ""),
+                        (psc.get("address") or {}).get("country", ""),
+                    ])
+                else:
+                    continue
+
+                for candidate in candidate_countries:
+                    normalized_country = normalize_country(candidate)
+                    if normalized_country:
+                        matched_countries.add(normalized_country)
+                        psc_target_country_match = True
+                    if is_uk_country(candidate):
+                        has_uk_psc = True
 
             total_results = int(payload.get("total_results", len(items)))
             start_index += len(items)
@@ -387,28 +414,20 @@ def fetch_psc_screening_cached(company_number: str, api_keys_tuple: tuple[str, .
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status in (400, 403, 404):
-                return "No", "", "No"
+                return "No", "", "No", "No"
             raise
 
         except requests.RequestException:
-            return "No", "", "No"
+            return "No", "", "No", "No"
 
     if matched_countries:
-        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_psc else "No"
-    return "No", "", "Yes" if has_uk_psc else "No"
+        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_psc else "No", "Yes" if psc_target_country_match else "No"
+    return "No", "", "Yes" if has_uk_psc else "No", "Yes" if psc_target_country_match else "No"
 
 
-def fetch_screening_cached(company_number: str, api_keys: List[str], screening_mode: str) -> Tuple[str, str, str]:
+def fetch_screening_cached(company_number: str, api_keys: List[str], screening_mode: str) -> Tuple[str, str, str, str]:
     if screening_mode == "PSC":
         return fetch_psc_screening_cached(company_number, tuple(api_keys))
-    return fetch_director_screening_cached(company_number, tuple(api_keys))
-
-
-def fetch_screening_fresh(company_number: str, api_keys: List[str], screening_mode: str) -> Tuple[str, str, str]:
-    if screening_mode == "PSC":
-        fetch_psc_screening_cached.clear()
-        return fetch_psc_screening_cached(company_number, tuple(api_keys))
-    fetch_director_screening_cached.clear()
     return fetch_director_screening_cached(company_number, tuple(api_keys))
 
 
@@ -517,6 +536,7 @@ def add_company_to_leads(
         "director_countries_flagged": str(row.get("director_countries_flagged", "No")).strip(),
         "matched_director_countries": str(row.get("matched_director_countries", "")).strip(),
         "uk_director": str(row.get("uk_director", "No")).strip(),
+        "psc_target_country_match": str(row.get("psc_target_country_match", "No")).strip(),
         "added_by": person,
         "added_at": now_uk_str(),
     }], columns=LEAD_COLUMNS)
@@ -540,7 +560,11 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["matched_director_countries"] = df["matched_director_countries"].fillna("").astype(str)
     if "uk_director" not in df.columns:
         df["uk_director"] = ""
+    if "psc_target_country_match" not in df.columns:
+        df["psc_target_country_match"] = "No"
+
     df["uk_director"] = df["uk_director"].fillna("No").astype(str)
+    df["psc_target_country_match"] = df["psc_target_country_match"].fillna("No").astype(str)
 
     df["is_tech_biotech"] = df["sector"].str.split(",").apply(
         lambda parts: bool({p.strip() for p in parts if p.strip()} & TECH_BIOTECH_CODES)
@@ -600,6 +624,7 @@ def screen_only_new_companies(
             "uk_director",
             "time_added_to_table",
             "pull_order",
+            "psc_target_country_match",
         ])
         existing_numbers = set()
     else:
@@ -607,10 +632,19 @@ def screen_only_new_companies(
         tmp["company_number"] = tmp["company_number"].astype(str).str.strip()
         if "uk_director" not in tmp.columns:
             tmp["uk_director"] = "No"
+        if "psc_target_country_match" not in tmp.columns:
+            tmp["psc_target_country_match"] = "No"
         tmp["pull_order"] = pd.to_numeric(tmp["pull_order"], errors="coerce").fillna(-1).astype(int)
         tmp = tmp.drop_duplicates(subset=["company_number"], keep="first")
         existing_lookup = tmp.set_index("company_number")[
-            ["director_countries_flagged", "matched_director_countries", "uk_director", "time_added_to_table", "pull_order"]
+            [
+                "director_countries_flagged",
+                "matched_director_countries",
+                "uk_director",
+                "time_added_to_table",
+                "pull_order",
+                "psc_target_country_match",
+            ]
         ]
         existing_numbers = set(existing_lookup.index)
 
@@ -642,6 +676,11 @@ def screen_only_new_companies(
             .map(existing_lookup["pull_order"])
             .fillna(screened_df.loc[known_mask, "pull_order"])
         )
+        screened_df.loc[known_mask, "psc_target_country_match"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["psc_target_country_match"])
+            .fillna("No")
+        )
 
     new_mask = ~known_mask
     if new_mask.any():
@@ -656,7 +695,7 @@ def screen_only_new_companies(
                     screening_mode,
                 )
             except Exception:
-                flags_lookup[company_number] = ("No", "", "No")
+                flags_lookup[company_number] = ("No", "", "No", "No")
 
         screened_df.loc[new_mask, "director_countries_flagged"] = (
             screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][0])
@@ -666,6 +705,9 @@ def screen_only_new_companies(
         )
         screened_df.loc[new_mask, "uk_director"] = (
             screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][2])
+        )
+        screened_df.loc[new_mask, "psc_target_country_match"] = (
+            screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][3])
         )
 
     screened_df["pull_order"] = pd.to_numeric(screened_df["pull_order"], errors="coerce").fillna(-1).astype(int)
@@ -677,39 +719,12 @@ def screen_only_new_companies(
     )
 
 
-def rescreen_company_in_state(
-    company_number: str,
-    api_keys: List[str],
-    snapshot_path: Path,
-    seen_path: Path,
-    screening_mode: str,
-) -> bool:
-    latest_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
-    if latest_df.empty:
-        return False
+def set_director_mode() -> None:
+    st.session_state["screening_mode"] = "Director"
 
-    working_df = latest_df.copy()
-    working_df["company_number"] = working_df["company_number"].astype(str).str.strip()
-    match_mask = working_df["company_number"] == str(company_number).strip()
-    if not match_mask.any():
-        return False
 
-    try:
-        flagged, matched_countries, uk_present = fetch_screening_fresh(company_number, api_keys, screening_mode)
-    except Exception:
-        return False
-
-    working_df.loc[match_mask, "director_countries_flagged"] = flagged
-    working_df.loc[match_mask, "matched_director_countries"] = matched_countries
-    working_df.loc[match_mask, "uk_director"] = uk_present
-
-    working_df = add_derived_columns(working_df)
-    working_df = get_sorted_current_df(working_df)
-    save_state(working_df, snapshot_path, seen_path)
-
-    st.session_state["latest_df"] = working_df
-    st.session_state["sorted_df"] = working_df
-    return True
+def set_psc_mode() -> None:
+    st.session_state["screening_mode"] = "PSC"
 
 
 def render_quick_add(
@@ -732,17 +747,18 @@ def render_quick_add(
         company_number = str(row.company_number).strip()
         already_added = company_number in existing_numbers
 
-        c1, c2, c3, c4, c5, c6 = st.columns([4.0, 1.1, 1.8, 2.0, 2.1, 0.9])
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([4.0, 1.1, 1.6, 2.0, 1.7, 2.1, 0.9])
         c1.write(f"**{row.company_name}**")
         c2.write(str(row.sector))
         c3.write(str(row.uk_director))
         c4.write(str(row.matched_director_countries).strip() if str(row.matched_director_countries).strip() else "-")
-        c5.write(str(row.time_added_to_table))
+        c5.write(str(row.psc_target_country_match))
+        c6.write(str(row.time_added_to_table))
 
         if already_added:
-            c6.caption("Added")
+            c7.caption("Added")
         else:
-            if c6.button("Add", key=f"add_{screening_mode}_{person}_{company_number}_{idx}"):
+            if c7.button("Add", key=f"add_{screening_mode}_{person}_{company_number}_{idx}"):
                 added = add_company_to_leads(
                     person,
                     run_date,
@@ -754,92 +770,12 @@ def render_quick_add(
                         "director_countries_flagged": row.director_countries_flagged,
                         "matched_director_countries": row.matched_director_countries,
                         "uk_director": row.uk_director,
+                        "psc_target_country_match": row.psc_target_country_match,
                     }),
                     existing_leads,
                 )
                 if added:
                     st.rerun()
-
-
-def render_manual_rescreen(
-    api_keys: List[str],
-    snapshot_path: Path,
-    seen_path: Path,
-    screening_mode: str,
-    labels: Dict[str, str],
-) -> None:
-    with st.expander(f"Manual re-screen ({labels['short_source_name']})", expanded=False):
-        latest_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
-        if latest_df.empty:
-            st.info("No companies available to re-screen yet.")
-            return
-
-        unscreened_df = latest_df[
-            latest_df["director_countries_flagged"].astype(str).str.lower() != "yes"
-        ].copy()
-
-        total_to_rescreen = len(unscreened_df)
-        if total_to_rescreen == 0:
-            st.success(f"All companies currently shown have already been identified with a target {labels['short_source_name']} country.")
-            return
-
-        st.write(f"Companies available for one-click re-screen using {labels['source_name']}: **{total_to_rescreen}**")
-
-        if st.button(f"Re-screen all non-flagged companies using {labels['short_source_name']}", key=f"manual_rescreen_button_{screening_mode}"):
-            working_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS)).copy()
-            if working_df.empty:
-                st.error("Unable to load companies for re-screening right now.")
-                return
-
-            working_df["company_number"] = working_df["company_number"].astype(str).str.strip()
-            company_numbers = unscreened_df["company_number"].astype(str).str.strip().tolist()
-            updated_count = 0
-
-            if screening_mode == "PSC":
-                fetch_psc_screening_cached.clear()
-            else:
-                fetch_director_screening_cached.clear()
-
-            with st.spinner(f"Re-screening {total_to_rescreen} non-flagged companies using {labels['source_name']}..."):
-                for company_number in company_numbers:
-                    try:
-                        flagged, matched_countries, uk_present = fetch_screening_cached(
-                            company_number,
-                            api_keys,
-                            screening_mode,
-                        )
-                    except Exception:
-                        continue
-
-                    match_mask = working_df["company_number"] == company_number
-                    if not match_mask.any():
-                        continue
-
-                    working_df.loc[match_mask, "director_countries_flagged"] = flagged
-                    working_df.loc[match_mask, "matched_director_countries"] = matched_countries
-                    working_df.loc[match_mask, "uk_director"] = uk_present
-                    updated_count += 1
-
-            if updated_count == 0:
-                st.error("Unable to re-screen the non-flagged companies right now.")
-                return
-
-            working_df = add_derived_columns(working_df)
-            working_df = get_sorted_current_df(working_df)
-            save_state(working_df, snapshot_path, seen_path)
-
-            st.session_state["latest_df"] = working_df
-            st.session_state["sorted_df"] = working_df
-            st.success(f"Re-screened {updated_count} non-flagged companies using fresh {labels['source_name']} data.")
-            st.rerun()
-
-
-def set_director_mode() -> None:
-    st.session_state["screening_mode"] = "Director"
-
-
-def set_psc_mode() -> None:
-    st.session_state["screening_mode"] = "PSC"
 
 
 def main() -> None:
@@ -863,6 +799,11 @@ def main() -> None:
     st.sidebar.header("Controls")
     selected_user = st.sidebar.selectbox("Working as", TEAM_MEMBERS, index=0)
     show_flagged_only = st.sidebar.checkbox("Show only flagged country matches", value=True)
+
+    if screening_mode == "PSC":
+        show_psc_target_only = st.sidebar.checkbox("Show only PSC target-country matches", value=False)
+    else:
+        show_psc_target_only = False
 
     st.sidebar.subheader("Screening source")
     c_mode_1, c_mode_2 = st.sidebar.columns(2)
@@ -924,23 +865,30 @@ def main() -> None:
             matched_country_directors_df["director_countries_flagged"].astype(str).str.lower() == "yes"
         ].reset_index(drop=True)
 
+    if screening_mode == "PSC" and show_psc_target_only and not matched_country_directors_df.empty:
+        matched_country_directors_df = matched_country_directors_df[
+            matched_country_directors_df["psc_target_country_match"].astype(str).str.lower() == "yes"
+        ].reset_index(drop=True)
+
     total_pulled = int(len(current_df))
     total_flagged = int(
         (current_df["director_countries_flagged"].astype(str).str.lower() == "yes").sum()
     ) if not current_df.empty else 0
+    total_psc_target_matches = int(
+        (current_df["psc_target_country_match"].astype(str).str.lower() == "yes").sum()
+    ) if not current_df.empty else 0
     total_leads = int(len(leads_df))
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total pulled today", total_pulled)
     c2.metric(f"Flagged by {labels['short_source_name']} country", total_flagged)
-    c3.metric(f"{selected_user}'s leads today", total_leads)
+    c3.metric("PSC target-country matches", total_psc_target_matches)
+    c4.metric(f"{selected_user}'s leads today", total_leads)
 
     st.caption(
         f"Working as {selected_user} | Screening source: {labels['source_name']} | "
         f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}"
     )
-
-    render_manual_rescreen(api_keys, snapshot_path, seen_path, screening_mode, labels)
 
     newest_df = matched_country_directors_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True)
     render_quick_add(newest_df, selected_user, run_date, screening_mode, leads_df, labels)
@@ -955,6 +903,7 @@ def main() -> None:
                 "uk_director",
                 "director_countries_flagged",
                 "matched_director_countries",
+                "psc_target_country_match",
                 "tech_biotech_international_match",
                 "time_added_to_table",
             ]].rename(columns={
@@ -963,6 +912,7 @@ def main() -> None:
                 "uk_director": labels["uk_label"],
                 "director_countries_flagged": labels["flag_label"],
                 "matched_director_countries": labels["match_label"],
+                "psc_target_country_match": labels["target_highlight_label"],
                 "tech_biotech_international_match": f"Tech/Biotech {labels['short_source_name']} International Match",
                 "time_added_to_table": "Time Added To Table",
             })
@@ -978,6 +928,7 @@ def main() -> None:
                 "uk_director",
                 "director_countries_flagged",
                 "matched_director_countries",
+                "psc_target_country_match",
                 "time_added_to_table",
             ]].rename(columns={
                 "company_name": "Company Name",
@@ -985,6 +936,7 @@ def main() -> None:
                 "uk_director": labels["uk_label"],
                 "director_countries_flagged": labels["flag_label"],
                 "matched_director_countries": labels["match_label"],
+                "psc_target_country_match": labels["target_highlight_label"],
                 "time_added_to_table": "Time Added To Table",
             })
             st.dataframe(matched_display, use_container_width=True, hide_index=True)
