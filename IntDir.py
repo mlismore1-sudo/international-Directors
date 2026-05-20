@@ -1,751 +1,852 @@
-"""
-Companies House Screening Tool
-================================
-Run:     streamlit run companies_house_screening.py
-Secrets: COMPANIES_HOUSE_API_KEY_1 / _2 / _3 in .streamlit/secrets.toml
-Install: pip install streamlit requests pandas
-"""
-
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
-from itertools import cycle
+import base64
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
+from pandas.errors import EmptyDataError, ParserError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="CH Screening Tool",
-    page_icon="🏢",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SPEED OPTIMISATION 1 — Persistent disk cache (screened companies never re-fetched)
-# Each screened company is written to a per-company JSON file under .ch_cache/
-# On startup the entire cache is loaded into memory. A company is only re-fetched
-# if the user explicitly hits "Refresh Cache".
-# ─────────────────────────────────────────────────────────────────────────────
-RESULTS_FILE  = Path("ch_screening_results_saved.json")
-DISK_CACHE_DIR = Path(".ch_cache")
-DISK_CACHE_DIR.mkdir(exist_ok=True)
-
-
-def _cache_path(cn: str) -> Path:
-    return DISK_CACHE_DIR / f"{cn}.json"
-
-
-def _write_disk_cache(cn: str, row: Dict) -> None:
-    try:
-        import json
-        _cache_path(cn).write_text(json.dumps(row), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _read_disk_cache(cn: str) -> Optional[Dict]:
-    p = _cache_path(cn)
-    if p.exists():
-        try:
-            import json
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-    return None
-
-
-def _load_all_disk_cache() -> Dict[str, Dict]:
-    """Load every cached company into memory on startup — O(1) lookups thereafter."""
-    import json
-    cache: Dict[str, Dict] = {}
-    for f in DISK_CACHE_DIR.glob("*.json"):
-        try:
-            cache[f.stem] = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return cache
-
-
-def _save_results(df: pd.DataFrame) -> None:
-    if df.empty:
-        return
-    RESULTS_FILE.write_text(
-        df.to_json(orient="records", date_format="iso"), encoding="utf-8"
-    )
-
-
-def _load_saved_results() -> pd.DataFrame:
-    if RESULTS_FILE.exists():
-        try:
-            return pd.read_json(RESULTS_FILE, orient="records")
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
-COMPANIES_HOUSE_BASE = "https://api.company-information.service.gov.uk"
-REQUEST_TIMEOUT      = 20
-
-# SPEED OPTIMISATION 2 — Shared persistent HTTP session with keep-alive
-# One TCP connection per API key is reused across all requests rather than
-# opening a new connection per call.
-_HTTP_SESSIONS: Dict[str, requests.Session] = {}
-
-TARGET_SICS: Set[str] = {
+TARGET_SIC_CODES = tuple(sorted({
     "62012", "62020", "63120", "47910", "46190", "46499",
     "70229", "73110", "74909", "68209", "64209", "68100",
     "32990", "10890", "86900", "93130", "96040", "82990",
     "72110",
+}))
+TARGET_SIC_CODE_SET = set(TARGET_SIC_CODES)
+
+TECH_BIOTECH_CODES = {"62012", "72110"}
+UK_COUNTRY_ALIASES = {
+    "uk", "u.k.", "united kingdom", "england", "scotland", "wales", "northern ireland", "great britain", "britain"
 }
 
-ALWAYS_PUBLISH_SICS: Set[str] = {"62012", "72110"}
-
-TARGET_COUNTRIES: Set[str] = {
-    "china", "france", "germany", "belgium", "netherlands",
-    "spain", "portugal", "lithuania", "poland", "norway",
-    "finland", "denmark", "sweden", "united states",
-    "india", "singapore", "hong kong",
+FLAGGED_COUNTRY_ALIASES = {
+    "france": "France",
+    "germany": "Germany",
+    "spain": "Spain",
+    "portugal": "Portugal",
+    "usa": "United States",
+    "u.s.a.": "United States",
+    "united states of america": "United States",
+    "united states": "United States",
+    "us": "United States",
+    "singapore": "Singapore",
+    "hong kong": "Hong Kong",
+    "finland": "Finland",
+    "iceland": "Iceland",
+    "norway": "Norway",
+    "sweden": "Sweden",
+    "denmark": "Denmark",
+    "belgium": "Belgium",
+    "netherlands": "Netherlands",
+    "poland": "Poland",
+    "italy": "Italy",
+    "austria": "Austria",
 }
 
-EXCLUDED_COUNTRIES: Set[str] = {"nigeria", "pakistan", "turkey"}
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+LEADS_DIR = DATA_DIR / "leads"
+LEADS_DIR.mkdir(exist_ok=True)
 
-ACCEPTED_COMPANY_TYPES: Set[str] = {
-    "ltd", "llp",
-    "private-limited-company",
-    "limited-liability-partnership",
-}
+TEAM_MEMBERS = ["Brad", "James"]
+QUICK_ADD_DEFAULT = 15
 
-_COUNTRY_ALIASES: Dict[str, str] = {
-    "turkiye":                    "turkey",
-    "türkiye":                    "turkey",
-    "uae":                        "united arab emirates",
-    "u.a.e.":                     "united arab emirates",
-    "england":                    "united kingdom",
-    "scotland":                   "united kingdom",
-    "wales":                      "united kingdom",
-    "northern ireland":           "united kingdom",
-    "usa":                        "united states",
-    "u.s.a.":                     "united states",
-    "united states of america":   "united states",
-    "us":                         "united states",
-    "hk":                         "hong kong",
-    "prc":                        "china",
-    "peoples republic of china":  "china",
-    "people's republic of china": "china",
-    "holland":                    "netherlands",
-    "the netherlands":            "netherlands",
-}
-
-_LEGAL_KIND_MARKERS: List[str] = [
-    "corporate-entity", "legal-person", "firm", "super-secure",
+RESULT_COLUMNS = [
+    "company_number",
+    "company_name",
+    "sector",
+    "director_countries_flagged",
+    "matched_director_countries",
+    "uk_director",
+    "time_added_to_table",
+    "pull_order",
 ]
 
-_CORPORATE_NAME_MARKERS: List[str] = [
-    " ltd", " limited", " llp", " plc", " inc",
-    " gmbh", " sarl", " bv", " ag", " oy", " spa",
-    " srl", " as ", " ab ", " nv ",
+LEAD_COLUMNS = [
+    "company_number",
+    "company_name",
+    "sector",
+    "director_countries_flagged",
+    "matched_director_countries",
+    "uk_director",
+    "added_by",
+    "added_at",
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API KEY ROTATION
-# ─────────────────────────────────────────────────────────────────────────────
-def _load_api_keys() -> List[str]:
-    keys = [
-        st.secrets.get("COMPANIES_HOUSE_API_KEY_1", "").strip(),
-        st.secrets.get("COMPANIES_HOUSE_API_KEY_2", "").strip(),
-        st.secrets.get("COMPANIES_HOUSE_API_KEY_3", "").strip(),
-    ]
-    return [k for k in keys if k]
+
+def today_uk_str() -> str:
+    return datetime.now().astimezone().date().isoformat()
 
 
-def _get_key_rotator() -> Iterator[str]:
-    if "key_rotator" not in st.session_state:
-        keys = _load_api_keys()
-        if not keys:
-            st.error(
-                "**No API keys found.**\n\n"
-                "Add to your Streamlit secrets:\n"
-                "```toml\n"
-                'COMPANIES_HOUSE_API_KEY_1 = "your_first_key"\n'
-                'COMPANIES_HOUSE_API_KEY_2 = "your_second_key"\n'
-                'COMPANIES_HOUSE_API_KEY_3 = "your_third_key"\n'
-                "```"
-            )
-            st.stop()
-        st.session_state.key_rotator      = cycle(keys)
-        st.session_state.active_key_count = len(keys)
-    return st.session_state.key_rotator
+def now_uk_str() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _next_key() -> str:
-    return next(_get_key_rotator())
+def get_api_keys() -> List[str]:
+    keys: List[str] = []
+
+    list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
+    if list_style_keys:
+        keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
+
+    for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
+        value = st.secrets.get(key_name, "")
+        if value:
+            keys.append(str(value).strip())
+
+    deduped = []
+    seen = set()
+    for key in keys:
+        if key and key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    return deduped
 
 
-def _get_http_session(api_key: str) -> requests.Session:
-    """OPTIMISATION 2 — reuse one session per key (TCP keep-alive)."""
-    if api_key not in _HTTP_SESSIONS:
-        s = requests.Session()
-        s.auth = (api_key, "")
-        s.headers.update({"Accept": "application/json"})
-        # SPEED OPTIMISATION 3 — retry with backoff on transient failures
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        retry = Retry(
-            total=3,
-            backoff_factor=0.3,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        s.mount("https://", adapter)
-        _HTTP_SESSIONS[api_key] = s
-    return _HTTP_SESSIONS[api_key]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SESSION STATE
-# ─────────────────────────────────────────────────────────────────────────────
-def _init_session() -> None:
-    defaults: Dict[str, Any] = {
-        "refresh_token":     0,
-        "last_refreshed_at": None,
+def auth_header(api_key: str) -> Dict[str, str]:
+    token = base64.b64encode(f"{api_key}:".encode()).decode()
+    return {
+        "Authorization": f"Basic {token}",
+        "User-Agent": "streamlit-companies-house-today-app",
     }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
 
-    # SPEED OPTIMISATION 1 — load entire disk cache into memory once on startup
-    if "disk_cache" not in st.session_state:
-        st.session_state.disk_cache = _load_all_disk_cache()
 
-    if "results_df" not in st.session_state:
-        st.session_state.results_df = _load_saved_results()
+def classify_sector(sic_codes: List[str]) -> Optional[str]:
+    codes = {str(code).strip() for code in (sic_codes or []) if str(code).strip()}
+    matched_codes = sorted(codes & TARGET_SIC_CODE_SET)
+    return ", ".join(matched_codes) if matched_codes else None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COUNTRY NORMALISATION
-# ─────────────────────────────────────────────────────────────────────────────
-def _normalise(value: Optional[str]) -> str:
+
+def parse_sector_codes(sector_value: str) -> set[str]:
+    if not sector_value:
+        return set()
+    return {code.strip() for code in str(sector_value).split(",") if code.strip()}
+
+
+def clean_country(value: Optional[str]) -> str:
     if not value:
         return ""
-    cleaned = re.sub(r"\s+", " ", str(value).strip().lower())
-    return _COUNTRY_ALIASES.get(cleaned, cleaned)
+    return " ".join(str(value).strip().lower().split())
 
 
-_NORM_TARGETS:  Set[str] = {_normalise(c) for c in TARGET_COUNTRIES}
-_NORM_EXCLUDED: Set[str] = {_normalise(c) for c in EXCLUDED_COUNTRIES}
+def normalize_country(value: Optional[str]) -> str:
+    cleaned = clean_country(value)
+    return FLAGGED_COUNTRY_ALIASES.get(cleaned, "")
 
 
-def _is_target(value: Optional[str]) -> bool:
-    return _normalise(value) in _NORM_TARGETS
+def is_uk_country(value: Optional[str]) -> bool:
+    return clean_country(value) in UK_COUNTRY_ALIASES
 
 
-def _is_excluded(value: Optional[str]) -> bool:
-    return _normalise(value) in _NORM_EXCLUDED
+@st.cache_resource(show_spinner=False)
+def get_session() -> requests.Session:
+    session = requests.Session()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-def _get(url: str, params: Optional[Dict] = None) -> Dict:
-    api_key = _next_key()
-    resp    = _get_http_session(api_key).get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json() if resp.text.strip() else {}
-
-
-def _paginated(url: str, items_key: str = "items", page: int = 100) -> List[Dict]:
-    out: List[Dict] = []
-    start = 0
-    while True:
-        data  = _get(url, {"items_per_page": page, "start_index": start})
-        batch = data.get(items_key) or []
-        out.extend(batch)
-        if len(batch) < page:
-            break
-        start += page
-    return out
-
-
-def api_search_by_date(incorporated_from: date) -> List[Dict]:
-    # SPEED OPTIMISATION 4 — search all SIC codes concurrently with a thread pool
-    all_results: List[Dict] = []
-    date_str = incorporated_from.strftime("%Y-%m-%d")
-
-    def _fetch_sic(sic: str) -> List[Dict]:
-        sic_results: List[Dict] = []
-        start = 0
-        while True:
-            try:
-                data = _get(
-                    f"{COMPANIES_HOUSE_BASE}/advanced-search/companies",
-                    params={
-                        "incorporated_from": date_str,
-                        "company_status":    "active",
-                        "company_type":      "ltd,llp",
-                        "sic_codes":         sic,
-                        "items_per_page":    100,
-                        "start_index":       start,
-                    },
-                )
-            except requests.HTTPError:
-                break
-            batch = data.get("items") or []
-            sic_results.extend(batch)
-            total = data.get("total_results", 0)
-            start += len(batch)
-            if not batch or start >= total:
-                break
-        return sic_results
-
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(_fetch_sic, sic): sic for sic in TARGET_SICS}
-        for future in as_completed(futures):
-            try:
-                all_results.extend(future.result())
-            except Exception:
-                pass
-
-    return all_results
-
-
-def api_profile(cn: str) -> Dict:
-    return _get(f"{COMPANIES_HOUSE_BASE}/company/{cn}")
-
-
-def api_officers(cn: str) -> List[Dict]:
-    return _paginated(f"{COMPANIES_HOUSE_BASE}/company/{cn}/officers")
-
-
-def api_pscs(cn: str) -> List[Dict]:
-    return _paginated(
-        f"{COMPANIES_HOUSE_BASE}/company/{cn}/persons-with-significant-control",
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
     )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCREENING LOGIC
-# ─────────────────────────────────────────────────────────────────────────────
-def _psc_is_legal_entity(psc: Dict) -> bool:
-    kind = str(psc.get("kind", "")).lower()
-    name = str(psc.get("name", "")).strip()
-    if any(m in kind for m in _LEGAL_KIND_MARKERS):
-        return True
-    if any(m in f" {name.lower()}" for m in _CORPORATE_NAME_MARKERS):
-        return True
-    natures = [str(x).lower() for x in psc.get("natures_of_control") or []]
-    return (
-        any("ownership-of-shares" in n or "voting-rights" in n for n in natures)
-        and not psc.get("nationality")
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=50,
+        pool_maxsize=50,
     )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
-def screen_pscs(pscs: List[Dict]) -> Dict:
-    legal_entities:   List[str] = []
-    target_nationals: List[str] = []
-    excluded_found = False
+def fetch_with_rotation(
+    url: str,
+    params: Dict[str, str],
+    api_keys: List[str],
+    timeout: Tuple[float, float] = (3.05, 20),
+    allow_not_found: bool = False,
+) -> requests.Response:
+    session = get_session()
+    last_response = None
 
-    for psc in pscs:
-        if _psc_is_legal_entity(psc):
-            legal_entities.append(str(psc.get("name", "Unknown entity")))
-        nat = psc.get("nationality")
-        if _is_target(nat):
-            target_nationals.append(f"{psc.get('name', 'Unknown')} ({nat})")
-        if _is_excluded(nat):
-            excluded_found = True
+    for api_key in api_keys:
+        response = session.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
 
-    return {
-        "owned_by_company":        bool(legal_entities),
-        "owning_company_names":    "; ".join(legal_entities),
-        "psc_from_target_country": bool(target_nationals),
-        "psc_target_details":      "; ".join(target_nationals),
-        "psc_excluded":            excluded_found,
-    }
-
-
-def screen_officers(officers: List[Dict]) -> Dict:
-    target_directors: List[str] = []
-    excluded_found = False
-
-    for o in officers:
-        if str(o.get("officer_role", "")).lower() != "director":
+        if response.status_code in (401, 429):
+            last_response = response
             continue
-        res = o.get("country_of_residence") or o.get("usual_residential_country")
-        nat = o.get("nationality")
-        hit = res if _is_target(res) else (nat if _is_target(nat) else None)
-        if hit:
-            target_directors.append(f"{o.get('name', 'Unknown')} ({hit})")
-        if _is_excluded(res) or _is_excluded(nat):
-            excluded_found = True
 
-    return {
-        "director_from_target_country": bool(target_directors),
-        "director_target_details":      "; ".join(target_directors),
-        "director_excluded":            excluded_found,
-    }
+        if allow_not_found and response.status_code == 404:
+            return response
+
+        response.raise_for_status()
+        return response
+
+    if last_response is not None:
+        if allow_not_found and last_response.status_code == 404:
+            return last_response
+        last_response.raise_for_status()
+
+    raise RuntimeError("No valid Companies House API keys were available.")
 
 
-def decide_publish(psc: Dict, officers: Dict, sic_codes: Set[str]) -> Dict:
-    always_publish = bool(sic_codes & ALWAYS_PUBLISH_SICS)
-    excluded       = psc["psc_excluded"] or officers["director_excluded"]
-    any_flag       = (
-        psc["owned_by_company"]
-        or psc["psc_from_target_country"]
-        or officers["director_from_target_country"]
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_companies_incorporated_today(api_keys_tuple: tuple[str, ...], run_date: str) -> pd.DataFrame:
+    api_keys = list(api_keys_tuple)
+    url = "https://api.company-information.service.gov.uk/advanced-search/companies"
+    start_index = 0
+    page_size = 5000
+    rows = []
+    pull_counter = 0
+    timestamp = now_uk_str()
+
+    while True:
+        params = {
+            "incorporated_from": run_date,
+            "incorporated_to": run_date,
+            "sic_codes": ",".join(TARGET_SIC_CODES),
+            "size": str(page_size),
+            "start_index": str(start_index),
+        }
+
+        response = fetch_with_rotation(url, params, api_keys)
+        payload = response.json()
+        items = payload.get("items", []) or []
+
+        if not items:
+            break
+
+        for item in items:
+            sector = classify_sector(item.get("sic_codes", []) or [])
+            if not sector:
+                continue
+
+            rows.append({
+                "company_number": str(item.get("company_number", "")).strip(),
+                "company_name": str(item.get("company_name", "")).strip(),
+                "sector": sector,
+                "director_countries_flagged": "No",
+                "matched_director_countries": "",
+                "uk_director": "No",
+                "time_added_to_table": timestamp,
+                "pull_order": pull_counter,
+            })
+            pull_counter += 1
+
+        if len(items) < page_size:
+            break
+
+        start_index += page_size
+
+    if not rows:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
+
+    return (
+        df.sort_values("pull_order", ascending=False, kind="stable")
+        .drop_duplicates(subset=["company_number"], keep="first")
+        .reset_index(drop=True)
     )
 
-    if excluded:
-        return {"should_publish": False, "publish_reason": "Excluded country detected"}
-    if always_publish:
-        return {"should_publish": True,  "publish_reason": "SIC 62012/72110 retained"}
-    if any_flag:
-        return {"should_publish": True,  "publish_reason": "Screening criteria matched"}
-    return     {"should_publish": False, "publish_reason": "No criteria matched"}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str]:
+    api_keys = list(api_keys_tuple)
+    url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
+    start_index = 0
+    items_per_page = 100
+    matched_countries = set()
+    has_uk_director = False
+
+    while True:
+        params = {
+            "items_per_page": str(items_per_page),
+            "start_index": str(start_index),
+        }
+
+        try:
+            response = fetch_with_rotation(
+                url=url,
+                params=params,
+                api_keys=api_keys,
+                allow_not_found=True,
+            )
+
+            if response.status_code == 404:
+                return "No", "", "No"
+
+            payload = response.json()
+            items = payload.get("items", []) or []
+
+            for officer in items:
+                if str(officer.get("officer_role", "")).strip().lower() != "director":
+                    continue
+
+                country_of_residence = officer.get("country_of_residence", "")
+                normalized_country = normalize_country(country_of_residence)
+                if normalized_country:
+                    matched_countries.add(normalized_country)
+                if is_uk_country(country_of_residence):
+                    has_uk_director = True
+
+            total_results = int(payload.get("total_results", len(items)))
+            start_index += len(items)
+
+            if not items or start_index >= total_results:
+                break
+
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (400, 403, 404):
+                return "No", "", "No"
+            raise
+
+        except requests.RequestException:
+            return "No", "", "No"
+
+    if matched_countries:
+        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_director else "No"
+    return "No", "", "Yes" if has_uk_director else "No"
 
 
-def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
-    sics = profile.get("sic_codes") or []
-    return {
-        "Company Name":              profile.get("company_name", ""),
-        "SIC Codes":                 ", ".join(map(str, sics)),
-        "Director Nationality":      "🌍 " + off["director_target_details"] if off["director_from_target_country"] else "—",
-        "Owned by Another Company":  "👨‍👧 " + psc["owning_company_names"] if psc["owned_by_company"] else "No",
-        "PSC from Target Country":   "🌍 " + psc["psc_target_details"] if psc["psc_from_target_country"] else "—",
-        "Publishable":               "✅ Yes" if pub["should_publish"] else "❌ No",
-        # Hidden reference fields (used in CSV export, not shown in table)
-        "_company_number":           cn,
-        "_incorporated":             profile.get("date_of_creation", ""),
-        "_ch_url":                   f"https://find-and-update.company-information.service.gov.uk/company/{cn}",
-        "_publish_reason":           pub["publish_reason"],
-    }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SPEED OPTIMISATION 1+5 — Two-tier cache: memory dict → disk → API
-# A company is NEVER re-fetched unless the user clicks "Refresh Cache".
-# ─────────────────────────────────────────────────────────────────────────────
-def enrich_one(cn: str) -> Optional[Dict]:
-    token = st.session_state.refresh_token
-
-    # Tier 1: in-memory cache (fastest — no I/O)
-    mem = st.session_state.disk_cache.get(cn)
-    if mem and mem.get("_cache_token") == token:
-        return mem
-
-    # Tier 2: disk cache (fast — already screened in a previous session)
-    disk = _read_disk_cache(cn)
-    if disk and disk.get("_cache_token") == token:
-        st.session_state.disk_cache[cn] = disk
-        return disk
-
-    # Tier 3: live API call — filter on authoritative profile data first
-    profile = api_profile(cn)
-
-    status = str(profile.get("company_status", "")).lower()
-    ctype  = str(profile.get("type", "")).lower()
-    if status != "active" or ctype not in ACCEPTED_COMPANY_TYPES:
-        return None
-
-    # SPEED OPTIMISATION 6 — fetch officers and PSCs concurrently (2 calls at once)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_officers = pool.submit(api_officers, cn)
-        f_pscs     = pool.submit(api_pscs, cn)
-        officers   = f_officers.result()
-        pscs       = f_pscs.result()
-
-    sics      = {str(c) for c in (profile.get("sic_codes") or [])}
-    psc_flags = screen_pscs(pscs)
-    off_flags = screen_officers(officers)
-    pub_flags = decide_publish(psc_flags, off_flags, sics)
-    row       = build_row(cn, profile, psc_flags, off_flags, pub_flags)
-    row["_cache_token"] = token
-
-    # Write to both tiers
-    st.session_state.disk_cache[cn] = row
-    _write_disk_cache(cn, row)
-    return row
+def fetch_director_screening_fresh(company_number: str, api_keys: List[str]) -> Tuple[str, str, str]:
+    fetch_director_screening_cached.clear()
+    return fetch_director_screening_cached(company_number, tuple(api_keys))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SPEED OPTIMISATION 7 — parallel company enrichment with a thread pool
-# Companies are enriched 10 at a time concurrently rather than one by one.
-# ─────────────────────────────────────────────────────────────────────────────
-def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
-    # Deduplicate by company number
-    seen:   Set[str]  = set()
-    unique: List[str] = []
-    for r in search_rows:
-        cn = str(r.get("company_number", "")).strip()
-        if cn and cn not in seen:
-            seen.add(cn)
-            unique.append(cn)
-
-    if not unique:
-        st.warning("No company numbers returned by search.")
-        return pd.DataFrame()
-
-    # SPEED OPTIMISATION 8 — skip companies already in disk cache for this token
-    # Only new/uncached companies need an API call — massively reduces work on repeat runs.
-    token      = st.session_state.refresh_token
-    to_fetch:  List[str] = []
-    cached_rows: List[Dict] = []
-
-    for cn in unique:
-        cached = st.session_state.disk_cache.get(cn) or _read_disk_cache(cn)
-        if cached and cached.get("_cache_token") == token and cached.get("Company Name", "").strip():
-            cached_rows.append(cached)
-        else:
-            to_fetch.append(cn)
-
-    total     = len(to_fetch)
-    new_rows: List[Dict] = []
-
-    if total:
-        progress  = st.progress(0)
-        status_el = st.empty()
-        completed = 0
-
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(enrich_one, cn): cn for cn in to_fetch}
-            for future in as_completed(futures):
-                completed += 1
-                progress.progress(completed / total)
-                status_el.caption(f"Enriching {completed} / {total} new companies…")
-                try:
-                    row = future.result()
-                    if row and row.get("Company Name", "").strip():
-                        new_rows.append(row)
-                except Exception:
-                    pass
-
-        progress.empty()
-        status_el.empty()
-
-    all_rows = cached_rows + new_rows
-    return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UI COMPONENTS
-# ─────────────────────────────────────────────────────────────────────────────
-def render_sidebar() -> Dict[str, Any]:
-    with st.sidebar:
-        st.header("📅 Incorporation date")
-        incorporated_from = st.date_input(
-            "Companies incorporated from",
-            value=date.today(),
-            max_value=date.today(),
-            help="Only companies incorporated on or after this date will be screened.",
-        )
-
-        st.divider()
-        st.header("ℹ️ Active configuration")
-        st.caption(
-            f"**Target SIC codes:** {len(TARGET_SICS)}  \n"
-            f"**Target countries:** {len(TARGET_COUNTRIES)}  \n"
-            f"**Excluded:** Nigeria, Pakistan, Turkey  \n"
-            f"**Types:** Private Ltd, LLP (Active only)"
-        )
-
-        st.divider()
-        run = st.button("🔍 Run new search", use_container_width=True, type="primary")
-
-        st.divider()
-        col1, col2 = st.columns(2)
-        refresh = col1.button("🔄 Refresh cache", use_container_width=True,
-                              help="Forces all companies to be re-fetched from the API on next run.")
-        clear   = col2.button("🗑 Clear results", use_container_width=True,
-                              help="Removes all saved results and clears the screen.")
-
-        if refresh:
-            st.session_state.refresh_token    += 1
-            st.session_state.last_refreshed_at = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
-            # Clear in-memory cache so new token takes effect immediately
-            st.session_state.disk_cache = {}
-            st.success(f"Cache refreshed. Token: {st.session_state.refresh_token}")
-
-        if clear:
-            st.session_state.results_df = pd.DataFrame()
-            if RESULTS_FILE.exists():
-                RESULTS_FILE.unlink()
-            for f in DISK_CACHE_DIR.glob("*.json"):
-                f.unlink()
-            st.session_state.disk_cache = {}
-            st.success("All results and cache cleared.")
-
-        st.divider()
-        cached_count = len(list(DISK_CACHE_DIR.glob("*.json")))
-        st.caption(
-            f"🔑 Keys loaded: `{st.session_state.get('active_key_count', '—')}`  \n"
-            f"💾 Companies in cache: `{cached_count}`  \n"
-            f"Cache token: `{st.session_state.refresh_token}`  \n"
-            f"Last refresh: {st.session_state.last_refreshed_at or 'never'}"
-        )
-
-        if RESULTS_FILE.exists():
-            mtime = datetime.fromtimestamp(RESULTS_FILE.stat().st_mtime)
-            st.caption(f"Results last saved: {mtime.strftime('%d %b %Y %H:%M')}")
-
-    return {"incorporated_from": incorporated_from, "run": run}
+def get_store_paths(run_date: str) -> Tuple[Path, Path]:
+    snapshot_path = DATA_DIR / f"companies_{run_date}.csv"
+    seen_path = DATA_DIR / f"seen_{run_date}.csv"
+    return snapshot_path, seen_path
 
 
-def render_kpis(df: pd.DataFrame) -> None:
+def lead_file_path(person: str, run_date: str) -> Path:
+    return LEADS_DIR / f"{person.strip().lower()}_leads_{run_date}.csv"
+
+
+@st.cache_data(show_spinner=False)
+def load_results_csv(path_str: str, mtime: float) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    try:
+        df = pd.read_csv(path, dtype="string").fillna("")
+    except EmptyDataError:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    for col in RESULT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[RESULT_COLUMNS]
+
+
+@st.cache_data(show_spinner=False)
+def load_leads_csv(path_str: str, mtime: float) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+
+    try:
+        df = pd.read_csv(path, dtype="string", on_bad_lines="skip").fillna("")
+    except (EmptyDataError, ParserError):
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+    except Exception:
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+
+    for col in LEAD_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[LEAD_COLUMNS]
+
+
+def load_results(path: Path) -> pd.DataFrame:
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    return load_results_csv(str(path), mtime)
+
+
+def load_leads(person: str, run_date: str) -> pd.DataFrame:
+    path = lead_file_path(person, run_date)
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    return load_leads_csv(str(path), mtime)
+
+
+def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.DataFrame:
+    if current_df.empty:
+        return current_df.copy()
+    if seen_df.empty or "company_number" not in seen_df.columns:
+        return current_df.copy()
+
+    unseen = current_df[~current_df["company_number"].astype(str).isin(seen_df["company_number"].astype(str))].copy()
+    return unseen.reset_index(drop=True)
+
+
+def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -> None:
+    save_df = current_df.copy()
+
+    for transient_col in ["is_tech_biotech", "tech_biotech_international_match"]:
+        if transient_col in save_df.columns:
+            save_df = save_df.drop(columns=[transient_col])
+
+    save_df.to_csv(snapshot_path, index=False)
+    save_df.to_csv(seen_path, index=False)
+
+    load_results_csv.clear()
+
+
+def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_leads: pd.DataFrame) -> bool:
+    path = lead_file_path(person, run_date)
+    company_number = str(row.get("company_number", "")).strip()
+    if not company_number:
+        return False
+
+    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty else set()
+    if company_number in existing_numbers:
+        return False
+
+    new_row = pd.DataFrame([{
+        "company_number": company_number,
+        "company_name": str(row.get("company_name", "")).strip(),
+        "sector": str(row.get("sector", "")).strip(),
+        "director_countries_flagged": str(row.get("director_countries_flagged", "No")).strip(),
+        "matched_director_countries": str(row.get("matched_director_countries", "")).strip(),
+        "uk_director": str(row.get("uk_director", "No")).strip(),
+        "added_by": person,
+        "added_at": now_uk_str(),
+    }], columns=LEAD_COLUMNS)
+
+    file_exists = path.exists() and path.stat().st_size > 0
+    new_row.to_csv(path, mode="a", index=False, header=not file_exists)
+
+    load_leads_csv.clear()
+    return True
+
+
+def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
     if df.empty:
-        return
-    publishable = int((df["Publishable"] == "✅ Yes").sum()) if "Publishable" in df.columns else 0
-    owned_co    = int(df["Owned by Another Company"].str.startswith("👨").sum()) if "Owned by Another Company" in df.columns else 0
-    psc_target  = int((df["PSC from Target Country"] != "—").sum()) if "PSC from Target Country" in df.columns else 0
-    dir_target  = int((df["Director Nationality"] != "—").sum()) if "Director Nationality" in df.columns else 0
+        df["is_tech_biotech"] = pd.Series(dtype="bool")
+        df["tech_biotech_international_match"] = pd.Series(dtype="bool")
+        return df
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Companies screened",         len(df))
-    c2.metric("Publishable",                publishable)
-    c3.metric("Owned by a company",         owned_co)
-    c4.metric("PSC target country",         psc_target)
-    c5.metric("Director target nationality",dir_target)
+    df["sector"] = df["sector"].fillna("").astype(str)
+    df["matched_director_countries"] = df["matched_director_countries"].fillna("").astype(str)
+    if "uk_director" not in df.columns:
+        df["uk_director"] = ""
+    df["uk_director"] = df["uk_director"].fillna("No").astype(str)
 
+    df["is_tech_biotech"] = df["sector"].str.split(",").apply(
+        lambda parts: bool({p.strip() for p in parts if p.strip()} & TECH_BIOTECH_CODES)
+    )
 
-_TABLE_COLS = [
-    "Company Name",
-    "SIC Codes",
-    "Director Nationality",
-    "Owned by Another Company",
-    "PSC from Target Country",
-    "Publishable",
-]
+    df["tech_biotech_international_match"] = (
+        df["is_tech_biotech"] &
+        df["matched_director_countries"].str.strip().ne("")
+    )
+
+    return df
 
 
-def render_results(df: pd.DataFrame) -> None:
+def split_result_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df.empty:
-        st.info("No results yet — set an incorporation date and press **Run new search**.")
-        return
+        empty_df = pd.DataFrame(columns=df.columns)
+        return empty_df, empty_df
 
-    st.subheader(f"Results — {len(df)} companies")
+    tech_biotech_df = df[df["is_tech_biotech"]].reset_index(drop=True)
+    matched_country_directors_df = df[~df["is_tech_biotech"]].reset_index(drop=True)
+    return tech_biotech_df, matched_country_directors_df
 
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        show_pub = st.selectbox("Publishable", ["All", "Publishable only", "Not publishable only"])
-    with fc2:
-        show_owned = st.selectbox("Owned by another company", ["All", "Owned by company only", "Not owned by company"])
-    with fc3:
-        show_target = st.selectbox("PSC / Director nationality", ["All", "Target nationality present", "No target nationality"])
 
-    view = df.copy()
-    if show_pub == "Publishable only":
-        view = view[view["Publishable"] == "✅ Yes"]
-    elif show_pub == "Not publishable only":
-        view = view[view["Publishable"] == "❌ No"]
+def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-    if show_owned == "Owned by company only":
-        view = view[view["Owned by Another Company"].str.startswith("👨")]
-    elif show_owned == "Not owned by company":
-        view = view[view["Owned by Another Company"] == "No"]
+    sortable = df.copy()
+    sortable["pull_order"] = pd.to_numeric(sortable["pull_order"], errors="coerce").fillna(-1).astype(int)
 
-    if show_target == "Target nationality present":
-        view = view[(view["PSC from Target Country"] != "—") | (view["Director Nationality"] != "—")]
-    elif show_target == "No target nationality":
-        view = view[(view["PSC from Target Country"] == "—") & (view["Director Nationality"] == "—")]
-
-    cols = [c for c in _TABLE_COLS if c in view.columns]
-    st.dataframe(view[cols], use_container_width=True, height=560)
-    st.caption(f"Showing {len(view)} of {len(df)} companies after filters.")
-
-    # CSV export includes all fields including hidden reference columns
-    st.download_button(
-        "⬇ Download as CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="ch_screening_results.csv",
-        mime="text/csv",
+    return (
+        sortable.sort_values(
+            ["time_added_to_table", "pull_order"],
+            ascending=[False, False],
+            kind="stable",
+        )
+        .reset_index(drop=True)
     )
 
 
-def render_rules() -> None:
-    with st.expander("📋 Speed optimisations active"):
-        st.markdown("""
-| # | Optimisation | Effect |
-|---|---|---|
-| 1 | Per-company disk cache under `.ch_cache/` | Companies screened once — never re-fetched unless refreshed |
-| 2 | Persistent HTTP sessions with TCP keep-alive | Eliminates connection overhead on every request |
-| 3 | Automatic retry with exponential backoff | Recovers from 429/5xx without crashing |
-| 4 | SIC code searches run concurrently (5 threads) | 19 SIC searches complete ~4× faster |
-| 5 | Two-tier cache: memory dict → disk → API | Zero API calls for already-seen companies |
-| 6 | Officers + PSC fetched concurrently per company | Cuts per-company API time roughly in half |
-| 7 | Company enrichment runs 10 at a time in parallel | Bulk enrichment ~10× faster than sequential |
-| 8 | Pre-flight cache check before thread pool | Only new companies hit the API — instant for repeat runs |
-        """)
+def screen_only_new_companies(
+    fetched_df: pd.DataFrame,
+    existing_df: pd.DataFrame,
+    api_keys: List[str],
+) -> pd.DataFrame:
+    if fetched_df.empty:
+        return fetched_df.copy()
 
-    with st.expander("📋 Screening rules reference"):
-        st.markdown(f"""
-**Target SIC codes ({len(TARGET_SICS)}):** `{", ".join(sorted(TARGET_SICS))}`
+    screened_df = fetched_df.copy()
+    screened_df["company_number"] = screened_df["company_number"].astype(str).str.strip()
 
-**Target countries ({len(TARGET_COUNTRIES)}):** `{", ".join(sorted(TARGET_COUNTRIES))}`
+    if existing_df.empty or "company_number" not in existing_df.columns:
+        existing_lookup = pd.DataFrame(columns=[
+            "director_countries_flagged",
+            "matched_director_countries",
+            "uk_director",
+            "time_added_to_table",
+            "pull_order",
+        ])
+        existing_numbers = set()
+    else:
+        tmp = existing_df.copy()
+        tmp["company_number"] = tmp["company_number"].astype(str).str.strip()
+        if "uk_director" not in tmp.columns:
+            tmp["uk_director"] = "No"
+        tmp["pull_order"] = pd.to_numeric(tmp["pull_order"], errors="coerce").fillna(-1).astype(int)
+        tmp = tmp.drop_duplicates(subset=["company_number"], keep="first")
+        existing_lookup = tmp.set_index("company_number")[
+            ["director_countries_flagged", "matched_director_countries", "uk_director", "time_added_to_table", "pull_order"]
+        ]
+        existing_numbers = set(existing_lookup.index)
 
-**Excluded countries:** Nigeria, Pakistan, Turkey
+    known_mask = screened_df["company_number"].isin(existing_numbers)
 
-| Rule | Result |
-|---|---|
-| PSC tab contains a legal entity | 👨‍👧 Owned by Another Company = Yes |
-| PSC nationality matches a target country | 🌍 PSC from Target Country populated |
-| Director nationality/residency matches a target country | 🌍 Director Nationality populated |
-| SIC 62012 or 72110, no excluded country | Always published |
-| Excluded country found anywhere | Not published |
-| Not Active or not Private Ltd / LLP | Skipped |
-        """)
+    if known_mask.any():
+        screened_df.loc[known_mask, "director_countries_flagged"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["director_countries_flagged"])
+            .fillna("No")
+        )
+        screened_df.loc[known_mask, "matched_director_countries"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["matched_director_countries"])
+            .fillna("")
+        )
+        screened_df.loc[known_mask, "uk_director"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["uk_director"])
+            .fillna("No")
+        )
+        screened_df.loc[known_mask, "time_added_to_table"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["time_added_to_table"])
+            .fillna(screened_df.loc[known_mask, "time_added_to_table"])
+        )
+        screened_df.loc[known_mask, "pull_order"] = (
+            screened_df.loc[known_mask, "company_number"]
+            .map(existing_lookup["pull_order"])
+            .fillna(screened_df.loc[known_mask, "pull_order"])
+        )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-def main() -> None:
-    _init_session()
-    _get_key_rotator()
+    new_mask = ~known_mask
+    if new_mask.any():
+        new_company_numbers = screened_df.loc[new_mask, "company_number"].tolist()
+        flags_lookup = {}
 
-    st.title("🏢 Companies House Screening Tool")
-    st.caption(
-        f"Active · Private Ltd & LLP · {len(TARGET_SICS)} SIC codes · "
-        f"{len(TARGET_COUNTRIES)} target countries · Nigeria / Pakistan / Turkey suppressed · "
-        f"{st.session_state.get('active_key_count', '?')} API key(s) rotating · "
-        f"8 speed optimisations active"
-    )
-
-    controls = render_sidebar()
-    st.divider()
-
-    if controls["run"]:
-        with st.spinner(
-            f"Searching for companies incorporated from "
-            f"{controls['incorporated_from'].strftime('%d %b %Y')}…"
-        ):
+        for company_number in new_company_numbers:
             try:
-                raw = api_search_by_date(controls["incorporated_from"])
-            except requests.HTTPError as exc:
-                st.error(f"Search failed: {exc}")
-                st.stop()
+                flags_lookup[company_number] = fetch_director_screening_cached(
+                    company_number,
+                    tuple(api_keys),
+                )
+            except Exception:
+                flags_lookup[company_number] = ("No", "", "No")
 
-        if not raw:
-            st.warning("No companies returned. Try an earlier incorporation date.")
+        screened_df.loc[new_mask, "director_countries_flagged"] = (
+            screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][0])
+        )
+        screened_df.loc[new_mask, "matched_director_countries"] = (
+            screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][1])
+        )
+        screened_df.loc[new_mask, "uk_director"] = (
+            screened_df.loc[new_mask, "company_number"].map(lambda cn: flags_lookup[cn][2])
+        )
+
+    screened_df["pull_order"] = pd.to_numeric(screened_df["pull_order"], errors="coerce").fillna(-1).astype(int)
+
+    return (
+        screened_df
+        .drop_duplicates(subset=["company_number"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def rescreen_company_in_state(company_number: str, api_keys: List[str], snapshot_path: Path, seen_path: Path) -> bool:
+    latest_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    if latest_df.empty:
+        return False
+
+    working_df = latest_df.copy()
+    working_df["company_number"] = working_df["company_number"].astype(str).str.strip()
+    match_mask = working_df["company_number"] == str(company_number).strip()
+    if not match_mask.any():
+        return False
+
+    try:
+        flagged, matched_countries, uk_director = fetch_director_screening_fresh(company_number, api_keys)
+    except Exception:
+        return False
+
+    working_df.loc[match_mask, "director_countries_flagged"] = flagged
+    working_df.loc[match_mask, "matched_director_countries"] = matched_countries
+    working_df.loc[match_mask, "uk_director"] = uk_director
+
+    working_df = add_derived_columns(working_df)
+    working_df = get_sorted_current_df(working_df)
+    save_state(working_df, snapshot_path, seen_path)
+
+    st.session_state["latest_df"] = working_df
+    st.session_state["sorted_df"] = working_df
+    return True
+
+
+def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
+    st.subheader(f"Quick add to {person}'s leads")
+
+    if df.empty:
+        st.info("No companies available to add.")
+        return
+
+    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty else set()
+
+    for idx, row in enumerate(df.itertuples(index=False)):
+        company_number = str(row.company_number).strip()
+        already_added = company_number in existing_numbers
+
+        c1, c2, c3, c4, c5, c6 = st.columns([4.0, 1.1, 1.8, 2.0, 2.1, 0.9])
+        c1.write(f"**{row.company_name}**")
+        c2.write(str(row.sector))
+        c3.write(str(row.uk_director))
+        c4.write(str(row.matched_director_countries).strip() if str(row.matched_director_countries).strip() else "-")
+        c5.write(str(row.time_added_to_table))
+
+        if already_added:
+            c6.caption("Added")
         else:
-            st.info(f"Found **{len(raw)}** raw results. Checking cache and enriching new companies…")
-            new_df = enrich_all(raw)
+            if c6.button("Add", key=f"add_{person}_{company_number}_{idx}"):
+                added = add_company_to_leads(
+                    person,
+                    run_date,
+                    pd.Series({
+                        "company_number": row.company_number,
+                        "company_name": row.company_name,
+                        "sector": row.sector,
+                        "director_countries_flagged": row.director_countries_flagged,
+                        "matched_director_countries": row.matched_director_countries,
+                        "uk_director": row.uk_director,
+                    }),
+                    existing_leads,
+                )
+                if added:
+                    st.rerun()
 
-            if not new_df.empty:
-                existing = st.session_state.results_df
-                if not existing.empty and "Company Name" in existing.columns:
-                    combined = pd.concat([existing, new_df], ignore_index=True)
-                    combined = combined.drop_duplicates(subset=["Company Name"], keep="last")
-                else:
-                    combined = new_df
 
-                st.session_state.results_df = combined
-                _save_results(combined)
-                st.success(f"✅ Done. {len(new_df)} companies processed.")
+def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: Path) -> None:
+    with st.expander("Manual re-screen", expanded=False):
+        latest_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
+        if latest_df.empty:
+            st.info("No companies available to re-screen yet.")
+            return
 
-    render_kpis(st.session_state.results_df)
-    render_results(st.session_state.results_df)
-    render_rules()
+        unscreened_df = latest_df[
+            latest_df["director_countries_flagged"].astype(str).str.lower() != "yes"
+        ].copy()
+
+        total_to_rescreen = len(unscreened_df)
+        if total_to_rescreen == 0:
+            st.success("All companies currently shown have already been identified with a target country director.")
+            return
+
+        st.write(f"Companies available for one-click re-screen: **{total_to_rescreen}**")
+
+        if st.button("Re-screen all non-flagged companies", key="manual_rescreen_button"):
+            working_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS)).copy()
+            if working_df.empty:
+                st.error("Unable to load companies for re-screening right now.")
+                return
+
+            working_df["company_number"] = working_df["company_number"].astype(str).str.strip()
+            company_numbers = unscreened_df["company_number"].astype(str).str.strip().tolist()
+            updated_count = 0
+
+            fetch_director_screening_cached.clear()
+
+            with st.spinner(f"Re-screening {total_to_rescreen} non-flagged companies..."):
+                for company_number in company_numbers:
+                    try:
+                        flagged, matched_countries, uk_director = fetch_director_screening_cached(
+                            company_number,
+                            tuple(api_keys),
+                        )
+                    except Exception:
+                        continue
+
+                    match_mask = working_df["company_number"] == company_number
+                    if not match_mask.any():
+                        continue
+
+                    working_df.loc[match_mask, "director_countries_flagged"] = flagged
+                    working_df.loc[match_mask, "matched_director_countries"] = matched_countries
+                    working_df.loc[match_mask, "uk_director"] = uk_director
+                    updated_count += 1
+
+            if updated_count == 0:
+                st.error("Unable to re-screen the non-flagged companies right now.")
+                return
+
+            working_df = add_derived_columns(working_df)
+            working_df = get_sorted_current_df(working_df)
+            save_state(working_df, snapshot_path, seen_path)
+
+            st.session_state["latest_df"] = working_df
+            st.session_state["sorted_df"] = working_df
+            st.success(f"Re-screened {updated_count} non-flagged companies using fresh Companies House officer data.")
+            st.rerun()
+
+
+def main() -> None:
+    st.title("Companies Incorporated Today")
+    st.caption(f"Filtered to SIC codes: {', '.join(TARGET_SIC_CODES)}")
+
+    api_keys = get_api_keys()
+    if not api_keys:
+        st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
+        st.stop()
+
+    run_date = today_uk_str()
+    snapshot_path, seen_path = get_store_paths(run_date)
+
+    st.sidebar.header("Controls")
+    selected_user = st.sidebar.selectbox("Working as", TEAM_MEMBERS, index=0)
+    show_flagged_only = st.sidebar.checkbox("Show only flagged director countries", value=True)
+    refresh = st.sidebar.button("Refresh now", type="primary")
+
+    if refresh or not snapshot_path.exists():
+        with st.spinner("Refreshing Companies House data..."):
+            fetched_df = fetch_companies_incorporated_today(tuple(api_keys), run_date)
+            existing_df = load_results(snapshot_path)
+            screened_df = screen_only_new_companies(fetched_df, existing_df, api_keys)
+            screened_df = add_derived_columns(screened_df)
+
+            seen_df = load_results(seen_path)
+            new_df = identify_new_rows(screened_df, seen_df)
+
+            save_state(screened_df, snapshot_path, seen_path)
+
+            st.session_state["latest_df"] = screened_df
+            st.session_state["sorted_df"] = get_sorted_current_df(screened_df)
+            st.session_state["new_df"] = new_df
+            st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    else:
+        current_df = load_results(snapshot_path)
+        current_df = add_derived_columns(current_df)
+
+        st.session_state.setdefault("latest_df", current_df)
+        st.session_state.setdefault("sorted_df", get_sorted_current_df(current_df))
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=RESULT_COLUMNS))
+        st.session_state.setdefault("last_refresh", "Not refreshed in this session")
+
+    current_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    leads_df = load_leads(selected_user, run_date)
+
+    tech_biotech_df, matched_country_directors_df = split_result_tables(sorted_df)
+
+    if show_flagged_only and not matched_country_directors_df.empty:
+        matched_country_directors_df = matched_country_directors_df[
+            matched_country_directors_df["director_countries_flagged"].astype(str).str.lower() == "yes"
+        ].reset_index(drop=True)
+
+    total_pulled = int(len(current_df))
+    total_flagged = int(
+        (current_df["director_countries_flagged"].astype(str).str.lower() == "yes").sum()
+    ) if not current_df.empty else 0
+    total_leads = int(len(leads_df))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total pulled today", total_pulled)
+    c2.metric("Flagged by director country", total_flagged)
+    c3.metric(f"{selected_user}'s leads today", total_leads)
+
+    st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
+
+    render_manual_rescreen(api_keys, snapshot_path, seen_path)
+
+    newest_df = matched_country_directors_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True)
+    render_quick_add(newest_df, selected_user, run_date, leads_df)
+
+    with st.expander("Tech & Biotech Leads", expanded=True):
+        if tech_biotech_df.empty:
+            st.info("No tech or biotech leads to show yet.")
+        else:
+            tech_biotech_display = tech_biotech_df[[
+                "company_name",
+                "sector",
+                "uk_director",
+                "director_countries_flagged",
+                "matched_director_countries",
+                "tech_biotech_international_match",
+                "time_added_to_table",
+            ]].rename(columns={
+                "company_name": "Company Name",
+                "sector": "SIC Code(s)",
+                "uk_director": "UK Director",
+                "director_countries_flagged": "Director Countries Flagged",
+                "matched_director_countries": "Matched Director Countries",
+                "tech_biotech_international_match": "Tech/Biotech International Match",
+                "time_added_to_table": "Time Added To Table",
+            })
+            st.dataframe(tech_biotech_display, use_container_width=True, hide_index=True)
+
+    with st.expander("Matched Country Directors", expanded=False):
+        if matched_country_directors_df.empty:
+            st.info("No matched country director companies to show yet.")
+        else:
+            matched_display = matched_country_directors_df[[
+                "company_name",
+                "sector",
+                "uk_director",
+                "director_countries_flagged",
+                "matched_director_countries",
+                "time_added_to_table",
+            ]].rename(columns={
+                "company_name": "Company Name",
+                "sector": "SIC Code(s)",
+                "uk_director": "UK Director",
+                "director_countries_flagged": "Director Countries Flagged",
+                "matched_director_countries": "Matched Director Countries",
+                "time_added_to_table": "Time Added To Table",
+            })
+            st.dataframe(matched_display, use_container_width=True, hide_index=True)
+
+    with st.expander("Today's results CSV", expanded=False):
+        if current_df.empty:
+            st.info("No results available yet.")
+        else:
+            if not tech_biotech_df.empty:
+                st.download_button(
+                    label="Download tech & biotech leads CSV",
+                    data=tech_biotech_display.to_csv(index=False).encode("utf-8"),
+                    file_name=f"tech_biotech_leads_{run_date}.csv",
+                    mime="text/csv",
+                    key="download_tech_biotech_csv",
+                )
+
+            if not matched_country_directors_df.empty:
+                st.download_button(
+                    label="Download matched country directors CSV",
+                    data=matched_display.to_csv(index=False).encode("utf-8"),
+                    file_name=f"matched_country_directors_{run_date}.csv",
+                    mime="text/csv",
+                    key="download_matched_country_directors_csv",
+                )
 
 
 if __name__ == "__main__":
