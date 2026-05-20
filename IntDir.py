@@ -29,7 +29,7 @@ HTTP_SESSIONS: Dict[str, requests.Session] = {}
 TARGET_SICS: Set[str] = {
     "62012", "62020", "63120", "47910", "46190", "46499", "70229", "73110",
     "74909", "68209", "64209", "68100", "32990", "10890", "86900", "93130",
-    "96040", "82990", "72110",
+    "96040", "82990", "72110", "56101",
 }
 TECH_BIOTECH_SICS: Set[str] = {"62012", "72110"}
 TARGET_COUNTRIES: Set[str] = {
@@ -37,12 +37,20 @@ TARGET_COUNTRIES: Set[str] = {
     "lithuania", "poland", "norway", "finland", "denmark", "sweden",
     "united states", "india", "singapore", "hong kong",
 }
-ACCEPTED_COMPANY_TYPES: Set[str] = {"ltd", "llp", "private-limited-company", "limited-liability-partnership"}
+ACCEPTED_COMPANY_TYPES: Set[str] = {
+    "ltd", "llp", "private-limited-company", "limited-liability-partnership"
+}
 
 _COUNTRY_ALIASES: Dict[str, str] = {
-    "usa": "united states", "u.s.a.": "united states", "us": "united states",
-    "united states of america": "united states", "hk": "hong kong", "holland": "netherlands",
-    "the netherlands": "netherlands", "prc": "china", "peoples republic of china": "china",
+    "usa": "united states",
+    "u.s.a.": "united states",
+    "us": "united states",
+    "united states of america": "united states",
+    "hk": "hong kong",
+    "holland": "netherlands",
+    "the netherlands": "netherlands",
+    "prc": "china",
+    "peoples republic of china": "china",
     "people's republic of china": "china",
 }
 _LEGAL_KIND_MARKERS = ["corporate-entity", "legal-person", "firm", "super-secure"]
@@ -123,7 +131,12 @@ def _get_http_session(api_key: str) -> requests.Session:
         s = requests.Session()
         s.auth = (api_key, "")
         s.headers.update({"Accept": "application/json"})
-        retry = Retry(total=3, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
+        retry = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
         adapter = HTTPAdapter(max_retries=retry)
         s.mount("https://", adapter)
         HTTP_SESSIONS[api_key] = s
@@ -141,8 +154,9 @@ def _init_session() -> None:
         for col, default in {
             "Timestamp": "",
             "Company Name": "",
-            "SIC Codes": "",
             "Reason": "",
+            "Matched SIC": "",
+            "SIC Codes": "",
             "Tech & Biotech": False,
             "High Value Lead": False,
         }.items():
@@ -283,14 +297,21 @@ def build_reason(sics: Set[str], psc: Dict, off: Dict) -> str:
     return " | ".join(reasons)
 
 
-def build_row(cn: str, profile: Dict, psc: Dict, off: Dict) -> Dict:
-    sics = {str(x) for x in (profile.get("sic_codes") or [])}
+def match_sic_label(sics: Set[str]) -> str:
+    tech_hit = sorted(sics & TECH_BIOTECH_SICS)
+    if tech_hit:
+        return ", ".join(tech_hit)
+    return ", ".join(sorted(sics))
+
+
+def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, sics: Set[str]) -> Dict:
     is_tech_biotech = bool(sics & TECH_BIOTECH_SICS)
     is_high_value = bool((sics - TECH_BIOTECH_SICS) or ((sics & TECH_BIOTECH_SICS) and (off["director_target_residency"] or psc["psc_target_country"] or psc["owned_by_company"])))
     return {
         "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "Company Name": profile.get("company_name", ""),
         "Reason": build_reason(sics, psc, off),
+        "Matched SIC": match_sic_label(sics),
         "SIC Codes": ", ".join(sorted(sics)),
         "Tech & Biotech": is_tech_biotech,
         "High Value Lead": is_high_value,
@@ -314,7 +335,15 @@ def enrich_one(cn: str) -> Optional[Dict]:
     status = str(profile.get("company_status", "")).lower()
     ctype = str(profile.get("type", "")).lower()
     sics = {str(x) for x in (profile.get("sic_codes") or [])}
-    if status != "active" or ctype not in ACCEPTED_COMPANY_TYPES or not (sics & TARGET_SICS):
+    if status != "active" or ctype not in ACCEPTED_COMPANY_TYPES:
+        return None
+    if not sics:
+        sic_field = profile.get("sic_codes") or profile.get("sic_code") or []
+        if isinstance(sic_field, str):
+            sics = {x.strip() for x in re.split(r"[;,]", sic_field) if x.strip()}
+        else:
+            sics = {str(x) for x in sic_field if str(x).strip()}
+    if not (sics & TARGET_SICS):
         return None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -325,7 +354,7 @@ def enrich_one(cn: str) -> Optional[Dict]:
 
     psc_flags = screen_pscs(pscs)
     off_flags = screen_officers(officers)
-    row = build_row(cn, profile, psc_flags, off_flags)
+    row = build_row(cn, profile, psc_flags, off_flags, sics)
     st.session_state.disk_cache[cn] = row
     _write_disk_cache(cn, row)
     return row
@@ -407,15 +436,17 @@ def render_tables(df: pd.DataFrame) -> None:
         st.info("No results yet — choose a date and run the search.")
         return
 
-    tech = df[df["Tech & Biotech"] == True].copy()
-    high = df[df["High Value Lead"] == True].copy()
-    cols = ["Timestamp", "Company Name", "Reason", "SIC Codes"]
+    tech = df[df["Tech & Biotech"] == True].copy() if "Tech & Biotech" in df.columns else pd.DataFrame()
+    high = df[df["High Value Lead"] == True].copy() if "High Value Lead" in df.columns else pd.DataFrame()
+    cols = ["Timestamp", "Company Name", "Reason", "Matched SIC", "SIC Codes"]
+    tech_cols = [c for c in cols if c in tech.columns]
+    high_cols = [c for c in cols if c in high.columns]
 
     st.subheader(f"Tech & Biotech — {len(tech)} companies")
-    st.dataframe(tech[cols], use_container_width=True, height=300)
+    st.dataframe(tech[tech_cols], use_container_width=True, height=300)
 
     st.subheader(f"High Value Leads — {len(high)} companies")
-    st.dataframe(high[cols], use_container_width=True, height=420)
+    st.dataframe(high[high_cols], use_container_width=True, height=420)
 
     st.download_button(
         "⬇ Download all results as CSV",
