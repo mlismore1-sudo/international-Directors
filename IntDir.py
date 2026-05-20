@@ -2,17 +2,13 @@
 Companies House Screening Tool
 ================================
 Run:     streamlit run companies_house_screening.py
-Env vars:
-    COMPANIES_HOUSE_API_KEY_1=<key one>
-    COMPANIES_HOUSE_API_KEY_2=<key two>
-    COMPANIES_HOUSE_API_KEY_3=<key three>
+Secrets: COMPANIES_HOUSE_API_KEY_1 / _2 / _3 in .streamlit/secrets.toml
 Install: pip install streamlit requests pandas
 """
 
-import os
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime
 from itertools import cycle
 from typing import Any, Dict, Iterator, List, Optional, Set
 
@@ -21,7 +17,7 @@ import requests
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG  (must be the very first Streamlit call)
+# PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="CH Screening Tool",
@@ -33,28 +29,57 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-COMPANIES_HOUSE_BASE  = "https://api.company-information.service.gov.uk"
-REQUEST_TIMEOUT       = 20
-CACHE_TTL_SECONDS     = 43_200   # 12 hours
+COMPANIES_HOUSE_BASE = "https://api.company-information.service.gov.uk"
+REQUEST_TIMEOUT      = 20
+CACHE_TTL_SECONDS    = 43_200  # 12 hours
 
-_DEFAULT_TARGET_COUNTRIES: Set[str] = {
-    "nigeria", "pakistan", "turkey",
-    "india", "china", "russia",
-    "united arab emirates",
+# Target SIC codes — all are candidates if nationality/ownership criteria met
+TARGET_SICS: Set[str] = {
+    "62012", "62020", "63120", "47910", "46190", "46499",
+    "70229", "73110", "74909", "68209", "64209", "68100",
+    "32990", "10890", "86900", "93130", "96040", "82990",
+    "72110",
 }
 
-_PRIORITY_EXCEPTION_COUNTRIES: Set[str] = {"nigeria", "pakistan", "turkey"}
-_ALWAYS_PUBLISH_SICS: Set[str]           = {"62012", "72110"}
+# Always publish these two SIC codes unless an excluded country is matched
+ALWAYS_PUBLISH_SICS: Set[str] = {"62012", "72110"}
+
+# Target countries — PSC nationality or director residency triggers a flag
+TARGET_COUNTRIES: Set[str] = {
+    "china", "france", "germany", "belgium", "netherlands",
+    "spain", "portugal", "lithuania", "poland", "norway",
+    "finland", "denmark", "sweden", "united states",
+    "india", "singapore", "hong kong",
+}
+
+# Excluded countries — suppress publication even for always-publish SICs
+EXCLUDED_COUNTRIES: Set[str] = {"nigeria", "pakistan", "turkey"}
+
+# Accepted company types
+ACCEPTED_COMPANY_TYPES: Set[str] = {
+    "ltd",                       # Private Limited Company
+    "llp",                       # Limited Liability Partnership
+    "private-limited-company",
+    "limited-liability-partnership",
+}
 
 _COUNTRY_ALIASES: Dict[str, str] = {
-    "turkiye":          "turkey",
-    "türkiye":          "turkey",
-    "uae":              "united arab emirates",
-    "u.a.e.":           "united arab emirates",
-    "england":          "united kingdom",
-    "scotland":         "united kingdom",
-    "wales":            "united kingdom",
-    "northern ireland": "united kingdom",
+    "turkiye":           "turkey",
+    "türkiye":           "turkey",
+    "uae":               "united arab emirates",
+    "u.a.e.":            "united arab emirates",
+    "england":           "united kingdom",
+    "scotland":          "united kingdom",
+    "wales":             "united kingdom",
+    "northern ireland":  "united kingdom",
+    "usa":               "united states",
+    "u.s.a.":            "united states",
+    "united states of america": "united states",
+    "us":                "united states",
+    "hk":                "hong kong",
+    "prc":               "china",
+    "peoples republic of china": "china",
+    "people's republic of china": "china",
 }
 
 _LEGAL_KIND_MARKERS: List[str] = [
@@ -64,39 +89,36 @@ _LEGAL_KIND_MARKERS: List[str] = [
 _CORPORATE_NAME_MARKERS: List[str] = [
     " ltd", " limited", " llp", " plc", " inc",
     " gmbh", " sarl", " bv", " ag", " oy", " spa",
+    " srl", " as ", " ab ", " oy ", " nv ",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API KEY ROTATION
-# Reads up to 3 keys from environment variables.
-# All 3 must be set; requests rotate through them round-robin so rate limits
-# are spread evenly across keys.
+# API KEY ROTATION  (reads from Streamlit secrets)
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_api_keys() -> List[str]:
     keys = [
-        os.environ.get("COMPANIES_HOUSE_API_KEY_1", "").strip(),
-        os.environ.get("COMPANIES_HOUSE_API_KEY_2", "").strip(),
-        os.environ.get("COMPANIES_HOUSE_API_KEY_3", "").strip(),
+        st.secrets.get("COMPANIES_HOUSE_API_KEY_1", "").strip(),
+        st.secrets.get("COMPANIES_HOUSE_API_KEY_2", "").strip(),
+        st.secrets.get("COMPANIES_HOUSE_API_KEY_3", "").strip(),
     ]
     return [k for k in keys if k]
 
 
 def _get_key_rotator() -> Iterator[str]:
-    """Returns a persistent round-robin iterator stored in session state."""
     if "key_rotator" not in st.session_state:
         keys = _load_api_keys()
         if not keys:
             st.error(
                 "**No API keys found.**\n\n"
-                "Set at least one of the following environment variables before launching:\n"
-                "```\n"
-                "export COMPANIES_HOUSE_API_KEY_1=your_first_key\n"
-                "export COMPANIES_HOUSE_API_KEY_2=your_second_key\n"
-                "export COMPANIES_HOUSE_API_KEY_3=your_third_key\n"
+                "Add the following to your Streamlit secrets:\n"
+                "```toml\n"
+                'COMPANIES_HOUSE_API_KEY_1 = "your_first_key"\n'
+                'COMPANIES_HOUSE_API_KEY_2 = "your_second_key"\n'
+                'COMPANIES_HOUSE_API_KEY_3 = "your_third_key"\n'
                 "```"
             )
             st.stop()
-        st.session_state.key_rotator = cycle(keys)
+        st.session_state.key_rotator      = cycle(keys)
         st.session_state.active_key_count = len(keys)
     return st.session_state.key_rotator
 
@@ -109,11 +131,10 @@ def _next_key() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 def _init_session() -> None:
     defaults: Dict[str, Any] = {
-        "company_cache":           {},
-        "refresh_token":           0,
-        "results_df":              pd.DataFrame(),
-        "last_refreshed_at":       None,
-        "active_target_countries": _DEFAULT_TARGET_COUNTRIES.copy(),
+        "company_cache":     {},
+        "refresh_token":     0,
+        "results_df":        pd.DataFrame(),
+        "last_refreshed_at": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -133,17 +154,19 @@ def _norm_set(countries: Set[str]) -> Set[str]:
     return {_normalise(c) for c in countries}
 
 
+_NORM_TARGET_COUNTRIES:   Set[str] = _norm_set(TARGET_COUNTRIES)
+_NORM_EXCLUDED_COUNTRIES: Set[str] = _norm_set(EXCLUDED_COUNTRIES)
+
+
 def _is_target(value: Optional[str]) -> bool:
-    targets = _norm_set(st.session_state.get("active_target_countries", _DEFAULT_TARGET_COUNTRIES))
-    return _normalise(value) in targets
+    return _normalise(value) in _NORM_TARGET_COUNTRIES
 
 
-def _is_priority(value: Optional[str]) -> bool:
-    return _normalise(value) in _norm_set(_PRIORITY_EXCEPTION_COUNTRIES)
+def _is_excluded(value: Optional[str]) -> bool:
+    return _normalise(value) in _NORM_EXCLUDED_COUNTRIES
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMPANIES HOUSE API HELPERS
-# Each call pulls the next key from the rotator automatically.
 # ─────────────────────────────────────────────────────────────────────────────
 def _make_session(api_key: str) -> requests.Session:
     s = requests.Session()
@@ -153,7 +176,6 @@ def _make_session(api_key: str) -> requests.Session:
 
 
 def _get(url: str, params: Optional[Dict] = None) -> Dict:
-    """Single GET using the next key in rotation."""
     api_key = _next_key()
     resp    = _make_session(api_key).get(url, params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
@@ -161,7 +183,6 @@ def _get(url: str, params: Optional[Dict] = None) -> Dict:
 
 
 def _paginated(url: str, items_key: str = "items", page: int = 100) -> List[Dict]:
-    """Paginated GET; each page request rotates to the next key."""
     out: List[Dict] = []
     start = 0
     while True:
@@ -175,12 +196,43 @@ def _paginated(url: str, items_key: str = "items", page: int = 100) -> List[Dict
     return out
 
 
-def api_search(query: str, max_results: int) -> List[Dict]:
-    data = _get(
-        f"{COMPANIES_HOUSE_BASE}/search/companies",
-        {"q": query, "items_per_page": min(max_results, 100)},
-    )
-    return data.get("items") or []
+def api_search_by_incorporation_date(incorporated_from: date) -> List[Dict]:
+    """
+    Search Companies House advanced search filtering by incorporation date,
+    active status, company type, and SIC codes.
+    Returns all matching companies (no artificial cap).
+    """
+    all_results: List[Dict] = []
+    date_str    = incorporated_from.strftime("%Y-%m-%d")
+
+    for sic in TARGET_SICS:
+        start = 0
+        while True:
+            try:
+                data = _get(
+                    f"{COMPANIES_HOUSE_BASE}/advanced-search/companies",
+                    params={
+                        "incorporated_from": date_str,
+                        "company_status":    "active",
+                        "company_type":      "ltd,llp",
+                        "sic_codes":         sic,
+                        "items_per_page":    100,
+                        "start_index":       start,
+                    },
+                )
+            except requests.HTTPError:
+                break
+
+            batch = data.get("items") or []
+            all_results.extend(batch)
+
+            total_declared = data.get("total_results", 0)
+            start += len(batch)
+            if not batch or start >= total_declared:
+                break
+            time.sleep(0.05)
+
+    return all_results
 
 
 def api_profile(cn: str) -> Dict:
@@ -195,6 +247,15 @@ def api_pscs(cn: str) -> List[Dict]:
     return _paginated(
         f"{COMPANIES_HOUSE_BASE}/company/{cn}/persons-with-significant-control",
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPANY TYPE FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_accepted_type(company_type: Optional[str]) -> bool:
+    if not company_type:
+        return False
+    ct = company_type.strip().lower()
+    return ct in ACCEPTED_COMPANY_TYPES
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCREENING LOGIC
@@ -216,34 +277,39 @@ def _psc_is_legal_entity(psc: Dict) -> bool:
 def screen_pscs(pscs: List[Dict]) -> Dict:
     legal_flag     = False
     nat_flag       = False
+    excluded_flag  = False
     legal_names:   List[str] = []
     nationalities: List[str] = []
-    priority:      Optional[str] = None
+    excluded_nat:  List[str] = []
 
     for psc in pscs:
         if _psc_is_legal_entity(psc):
             legal_flag = True
             legal_names.append(str(psc.get("name", "Unknown PSC")))
+
         nat = psc.get("nationality")
         if _is_target(nat):
             nat_flag = True
             nationalities.append(str(nat))
-            if _is_priority(nat) and not priority:
-                priority = str(nat)
+        if _is_excluded(nat):
+            excluded_flag = True
+            excluded_nat.append(str(nat))
 
     return {
         "psc_legal_entity_flag":     legal_flag,
         "psc_legal_entity_names":    "; ".join(legal_names),
         "psc_nationality_flag":      nat_flag,
         "psc_matched_nationalities": "; ".join(nationalities),
-        "psc_priority_country":      priority,
+        "psc_excluded_flag":         excluded_flag,
+        "psc_excluded_nationalities": "; ".join(excluded_nat),
     }
 
 
 def screen_officers(officers: List[Dict]) -> Dict:
-    names:       List[str] = []
-    residencies: List[str] = []
-    priority:    Optional[str] = None
+    names:         List[str] = []
+    residencies:   List[str] = []
+    excluded_dirs: List[str] = []
+    excluded_res:  List[str] = []
 
     for o in officers:
         if str(o.get("officer_role", "")).lower() != "director":
@@ -252,46 +318,67 @@ def screen_officers(officers: List[Dict]) -> Dict:
         if _is_target(res):
             names.append(str(o.get("name", "Unknown")))
             residencies.append(str(res))
-            if _is_priority(res) and not priority:
-                priority = str(res)
+        if _is_excluded(res):
+            excluded_dirs.append(str(o.get("name", "Unknown")))
+            excluded_res.append(str(res))
 
     return {
         "director_residency_flag":      bool(names),
         "director_matched_names":       "; ".join(names),
         "director_matched_residencies": "; ".join(residencies),
-        "director_priority_country":    priority,
+        "director_excluded_flag":       bool(excluded_dirs),
+        "director_excluded_names":      "; ".join(excluded_dirs),
+        "director_excluded_residencies": "; ".join(excluded_res),
     }
 
 
 def decide_publish(profile: Dict, psc: Dict, officers: Dict) -> Dict:
     sics           = {str(c) for c in (profile.get("sic_codes") or [])}
-    always_publish = bool(sics & _ALWAYS_PUBLISH_SICS)
-    priority       = psc.get("psc_priority_country") or officers.get("director_priority_country")
+    always_publish = bool(sics & ALWAYS_PUBLISH_SICS)
+    excluded       = psc["psc_excluded_flag"] or officers["director_excluded_flag"]
     any_flag       = (
         psc["psc_legal_entity_flag"]
         or psc["psc_nationality_flag"]
         or officers["director_residency_flag"]
     )
 
-    if always_publish and not priority:
+    # Excluded country always wins — suppresses even always-publish SICs
+    if excluded:
+        excluded_countries = "; ".join(filter(None, [
+            psc.get("psc_excluded_nationalities", ""),
+            officers.get("director_excluded_residencies", ""),
+        ]))
         return {
-            "should_publish":           True,
-            "publish_reason":           "SIC 62012/72110 retained — no priority-exception country",
-            "priority_exception":       False,
-            "matched_priority_country": None,
+            "should_publish":  False,
+            "publish_reason":  f"Suppressed — excluded country detected: {excluded_countries}",
+            "flag_type":       "excluded",
         }
-    if priority:
+
+    if always_publish:
         return {
-            "should_publish":           any_flag,
-            "publish_reason":           f"Priority exception country: {priority}",
-            "priority_exception":       True,
-            "matched_priority_country": priority,
+            "should_publish": True,
+            "publish_reason": "SIC 62012/72110 retained — no excluded country",
+            "flag_type":      "sic-retained",
         }
+
+    if any_flag:
+        reasons = []
+        if psc["psc_legal_entity_flag"]:
+            reasons.append("PSC legal entity")
+        if psc["psc_nationality_flag"]:
+            reasons.append(f"PSC nationality: {psc['psc_matched_nationalities']}")
+        if officers["director_residency_flag"]:
+            reasons.append(f"Director residency: {officers['director_matched_residencies']}")
+        return {
+            "should_publish": True,
+            "publish_reason": "; ".join(reasons),
+            "flag_type":      "screening-match",
+        }
+
     return {
-        "should_publish":           any_flag,
-        "publish_reason":           "Screening rule matched" if any_flag else "No rule matched — not published",
-        "priority_exception":       False,
-        "matched_priority_country": None,
+        "should_publish": False,
+        "publish_reason": "No screening rule matched",
+        "flag_type":      "no-match",
     }
 
 
@@ -301,6 +388,7 @@ def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
     return {
         "company_number":               cn,
         "company_name":                 profile.get("company_name", ""),
+        "company_type":                 profile.get("type", ""),
         "status":                       profile.get("company_status", ""),
         "incorporated":                 profile.get("date_of_creation", ""),
         "sic_codes":                    ", ".join(map(str, sics)),
@@ -309,13 +397,16 @@ def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
         "psc_legal_entity_names":       psc["psc_legal_entity_names"],
         "psc_nationality_flag":         psc["psc_nationality_flag"],
         "psc_matched_nationalities":    psc["psc_matched_nationalities"],
+        "psc_excluded_flag":            psc["psc_excluded_flag"],
+        "psc_excluded_nationalities":   psc["psc_excluded_nationalities"],
         "director_residency_flag":      off["director_residency_flag"],
         "director_matched_names":       off["director_matched_names"],
         "director_matched_residencies": off["director_matched_residencies"],
-        "priority_exception":           pub["priority_exception"],
-        "matched_priority_country":     pub["matched_priority_country"] or "",
+        "director_excluded_flag":       off["director_excluded_flag"],
+        "director_excluded_names":      off["director_excluded_names"],
         "should_publish":               pub["should_publish"],
         "publish_reason":               pub["publish_reason"],
+        "flag_type":                    pub["flag_type"],
         "ch_url":                       f"https://find-and-update.company-information.service.gov.uk/company/{cn}",
     }
 
@@ -344,16 +435,24 @@ def enrich_one(cn: str) -> Dict:
 
 
 def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
+    # Deduplicate by company number before any API enrichment
     seen:   Set[str]  = set()
     unique: List[str] = []
     for r in search_rows:
         cn = str(r.get("company_number", "")).strip()
         if cn and cn not in seen:
+            # Pre-filter: must be active and accepted company type
+            status = str(r.get("company_status", "")).lower()
+            ctype  = str(r.get("company_type", r.get("type", ""))).lower()
+            if status != "active":
+                continue
+            if not _is_accepted_type(ctype):
+                continue
             seen.add(cn)
             unique.append(cn)
 
     if not unique:
-        st.warning("No valid company numbers returned by search.")
+        st.warning("No valid active Ltd/LLP companies found after filtering.")
         return pd.DataFrame()
 
     total    = len(unique)
@@ -367,14 +466,15 @@ def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
             rows.append(enrich_one(cn))
         except requests.HTTPError as exc:
             rows.append({
-                "company_number": cn, "company_name": "", "status": "",
-                "incorporated": "", "sic_codes": "", "address": "",
+                "company_number": cn, "company_name": "", "company_type": "",
+                "status": "", "incorporated": "", "sic_codes": "", "address": "",
                 "psc_legal_entity_flag": False, "psc_legal_entity_names": "",
                 "psc_nationality_flag": False, "psc_matched_nationalities": "",
+                "psc_excluded_flag": False, "psc_excluded_nationalities": "",
                 "director_residency_flag": False, "director_matched_names": "",
-                "director_matched_residencies": "", "priority_exception": False,
-                "matched_priority_country": "", "should_publish": False,
-                "publish_reason": f"API error: {exc}",
+                "director_matched_residencies": "", "director_excluded_flag": False,
+                "director_excluded_names": "", "should_publish": False,
+                "publish_reason": f"API error: {exc}", "flag_type": "error",
                 "ch_url": f"https://find-and-update.company-information.service.gov.uk/company/{cn}",
             })
         progress.progress(idx / total)
@@ -388,114 +488,128 @@ def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 def render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
-        st.header("🔍 Search")
-        query       = st.text_input("Company name or keyword", value="software development")
-        max_results = st.slider("Max results to enrich", 10, 100, 30, step=10)
-
-        st.header("🌍 Target countries")
-        all_country_opts = sorted(
-            _DEFAULT_TARGET_COUNTRIES | {"united kingdom", "france", "germany", "spain"}
-        )
-        selected_countries = st.multiselect(
-            "Countries",
-            options=all_country_opts,
-            default=sorted(_DEFAULT_TARGET_COUNTRIES),
-            help="PSC nationality and director country of residence are matched against these.",
+        st.header("📅 Incorporation date")
+        incorporated_from = st.date_input(
+            "Show companies incorporated from",
+            value=date(date.today().year, 1, 1),
+            max_value=date.today(),
+            help="Only companies incorporated on or after this date will be searched and screened.",
         )
 
-        st.header("🏷 SIC codes")
-        sic_filter = st.multiselect(
-            "Restrict search to SIC codes",
-            options=["62012", "72110", "62020", "62090", "63110"],
-            default=["62012", "72110"],
-            help="62012 and 72110 are always published unless a priority-exception country is found.",
+        st.divider()
+        st.header("ℹ️ Active filters")
+        st.caption(
+            f"**SIC codes:** {len(TARGET_SICS)} target codes  \n"
+            f"**Target countries:** {len(TARGET_COUNTRIES)}  \n"
+            f"**Excluded countries:** Nigeria, Pakistan, Turkey  \n"
+            f"**Company types:** Private Ltd, LLP  \n"
+            f"**Status:** Active only"
         )
 
         st.divider()
         col1, col2 = st.columns(2)
-        run     = col1.button("Search",  use_container_width=True, type="primary")
-        refresh = col2.button("Refresh", use_container_width=True,
-                              help="Bumps the cache token so all companies are re-fetched on next search.")
+        run     = col1.button("🔍 Run", use_container_width=True, type="primary")
+        refresh = col2.button("🔄 Refresh", use_container_width=True,
+                              help="Clears cache — companies will be re-fetched from the API on next run.")
+
         if refresh:
-            st.session_state.refresh_token     += 1
-            st.session_state.last_refreshed_at  = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
-            st.success(f"Cache cleared — token is now {st.session_state.refresh_token}.")
+            st.session_state.refresh_token    += 1
+            st.session_state.last_refreshed_at = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
+            st.success(f"Cache cleared. Token: {st.session_state.refresh_token}")
 
         st.divider()
-        key_count = st.session_state.get("active_key_count", "—")
         st.caption(
-            f"🔑 API keys loaded: `{key_count}`  \n"
+            f"🔑 Keys loaded: `{st.session_state.get('active_key_count', '—')}`  \n"
             f"Cache token: `{st.session_state.refresh_token}`  \n"
-            f"Last manual refresh: {st.session_state.last_refreshed_at or 'never this session'}"
+            f"Last refresh: {st.session_state.last_refreshed_at or 'never this session'}"
         )
 
     return {
-        "query":              query,
-        "max_results":        max_results,
-        "selected_countries": set(selected_countries),
-        "sic_filter":         set(sic_filter),
-        "run":                run,
+        "incorporated_from": incorporated_from,
+        "run":               run,
     }
 
 
 def render_kpis(df: pd.DataFrame) -> None:
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     def _n(col: str) -> int:
         return int(df[col].sum()) if (not df.empty and col in df.columns) else 0
-    c1.metric("Companies",                len(df))
+    c1.metric("Companies screened",       len(df))
     c2.metric("PSC legal entities",       _n("psc_legal_entity_flag"))
     c3.metric("PSC nationality flags",    _n("psc_nationality_flag"))
     c4.metric("Director residency flags", _n("director_residency_flag"))
-    c5.metric("Publishable",              _n("should_publish"))
+    c5.metric("Excluded country hits",    _n("psc_excluded_flag") + _n("director_excluded_flag"))
+    c6.metric("Publishable",              _n("should_publish"))
 
 
 _DISPLAY_COLS = [
-    "company_name", "company_number", "sic_codes", "status",
+    "company_name", "company_number", "company_type", "incorporated", "sic_codes",
     "psc_legal_entity_flag", "psc_legal_entity_names",
     "psc_nationality_flag",  "psc_matched_nationalities",
+    "psc_excluded_flag",     "psc_excluded_nationalities",
     "director_residency_flag", "director_matched_names", "director_matched_residencies",
-    "priority_exception", "matched_priority_country",
-    "should_publish", "publish_reason", "ch_url",
+    "director_excluded_flag", "director_excluded_names",
+    "should_publish", "publish_reason", "flag_type", "address", "ch_url",
 ]
 
 
-def _tab_df(df: pd.DataFrame) -> None:
+def _show_df(df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info("No companies in this category.")
+        return
     cols = [c for c in _DISPLAY_COLS if c in df.columns]
-    st.dataframe(df[cols], use_container_width=True, height=480)
+    st.dataframe(df[cols], use_container_width=True, height=500)
 
 
 def render_results(df: pd.DataFrame) -> None:
     if df.empty:
-        st.info("No results yet — enter a search term and press **Search**.")
+        st.info("No results yet — set an incorporation date and press **Run**.")
         return
 
-    n_pub  = int(df["should_publish"].sum())     if "should_publish"     in df.columns else 0
-    n_pri  = int(df["priority_exception"].sum()) if "priority_exception" in df.columns else 0
-    mask   = (
+    n_pub      = int(df["should_publish"].sum())      if "should_publish"      in df.columns else 0
+    n_excluded = int(df["psc_excluded_flag"].sum()) + int(df["director_excluded_flag"].sum()) \
+                 if "psc_excluded_flag" in df.columns else 0
+    n_legal    = int(df["psc_legal_entity_flag"].sum()) if "psc_legal_entity_flag" in df.columns else 0
+    mask_none  = (
         ~df.get("psc_legal_entity_flag",    pd.Series(False, index=df.index)).astype(bool)
         & ~df.get("psc_nationality_flag",   pd.Series(False, index=df.index)).astype(bool)
         & ~df.get("director_residency_flag", pd.Series(False, index=df.index)).astype(bool)
     )
-    n_none = int(mask.sum())
 
-    t_all, t_pub, t_pri, t_none = st.tabs([
-        f"All ({len(df)})",
-        f"Publishable ({n_pub})",
-        f"Priority exceptions ({n_pri})",
-        f"Unflagged ({n_none})",
+    t_pub, t_legal, t_geo, t_excl, t_all, t_none = st.tabs([
+        f"✅ Publishable ({n_pub})",
+        f"🏢 PSC legal entity ({n_legal})",
+        f"🌍 Geography flags ({int(df.get('psc_nationality_flag', pd.Series(False)).sum() + df.get('director_residency_flag', pd.Series(False)).sum())})",
+        f"🚫 Excluded ({n_excluded})",
+        f"📋 All ({len(df)})",
+        f"⬜ Unflagged ({int(mask_none.sum())})",
     ])
 
-    with t_all:
-        _tab_df(df)
     with t_pub:
-        sub = df[df["should_publish"]] if "should_publish" in df.columns else df.iloc[0:0]
-        _tab_df(sub) if not sub.empty else st.info("No publishable companies.")
-    with t_pri:
-        sub = df[df["priority_exception"]] if "priority_exception" in df.columns else df.iloc[0:0]
-        _tab_df(sub) if not sub.empty else st.info("No priority-exception companies.")
+        _show_df(df[df["should_publish"]] if "should_publish" in df.columns else df.iloc[0:0])
+
+    with t_legal:
+        _show_df(df[df["psc_legal_entity_flag"]] if "psc_legal_entity_flag" in df.columns else df.iloc[0:0])
+
+    with t_geo:
+        if "psc_nationality_flag" in df.columns and "director_residency_flag" in df.columns:
+            geo_mask = df["psc_nationality_flag"] | df["director_residency_flag"]
+            _show_df(df[geo_mask])
+        else:
+            st.info("No geography data.")
+
+    with t_excl:
+        if "psc_excluded_flag" in df.columns:
+            excl_mask = df["psc_excluded_flag"] | df["director_excluded_flag"]
+            _show_df(df[excl_mask])
+        else:
+            st.info("No excluded companies.")
+
+    with t_all:
+        _show_df(df)
+
     with t_none:
-        sub = df[mask]
-        _tab_df(sub) if not sub.empty else st.info("All companies have at least one flag.")
+        _show_df(df[mask_none])
 
     st.download_button(
         "⬇ Download full results as CSV",
@@ -506,18 +620,27 @@ def render_results(df: pd.DataFrame) -> None:
 
 
 def render_rules() -> None:
-    with st.expander("📋 Active screening rules"):
-        st.markdown("""
-| Rule | Behaviour |
+    with st.expander("📋 Screening rules reference"):
+        st.markdown(f"""
+**Target SIC codes ({len(TARGET_SICS)}):**
+`{", ".join(sorted(TARGET_SICS))}`
+
+**Target countries ({len(TARGET_COUNTRIES)}):**
+`{", ".join(sorted(TARGET_COUNTRIES))}`
+
+**Excluded countries:** Nigeria, Pakistan, Turkey
+
+| Rule | Outcome |
 |---|---|
-| PSC tab contains a legal entity | `psc_legal_entity_flag = True` |
-| PSC nationality matches a target country | `psc_nationality_flag = True` |
-| Any director is resident in a target country | `director_residency_flag = True` |
-| SIC 62012 or 72110, no priority-exception country | Always published regardless of flags |
-| SIC 62012 or 72110 **and** Nigeria / Pakistan / Turkey detected | Published only if a flag is also set |
-| No SIC match and no flags | Not published |
-| Same company number in results twice | Processed once — duplicate skipped |
-| Manual refresh not triggered | Cached enrichment reused for every lookup |
+| PSC tab contains a legal entity (corporate kind, Ltd/LLP name, or corporate control with no nationality) | `psc_legal_entity_flag = True` → published |
+| PSC nationality matches a target country | `psc_nationality_flag = True` → published |
+| Any director resident in a target country | `director_residency_flag = True` → published |
+| SIC 62012 or 72110 and no excluded country | Always published regardless of other flags |
+| Any excluded country (Nigeria / Pakistan / Turkey) detected anywhere | **Suppressed** — not published |
+| Company is not Active | Skipped before enrichment |
+| Company is not Private Ltd or LLP | Skipped before enrichment |
+| Same company number appears twice in search results | Processed once — duplicate skipped |
+| Company already in cache and refresh not triggered | Cached result reused — no API call made |
         """)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,46 +648,38 @@ def render_rules() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     _init_session()
-    _get_key_rotator()  # validates keys immediately on load
+    _get_key_rotator()  # validates keys on load — stops cleanly if missing
 
     st.title("🏢 Companies House Screening Tool")
     st.caption(
-        "Flags PSC legal entities · PSC nationality · director residency  |  "
-        "SIC 62012 and 72110 always published unless Nigeria, Pakistan, or Turkey is detected.  |  "
-        f"Running with {st.session_state.get('active_key_count', '?')} API key(s) in rotation."
+        f"Active · Private Ltd & LLP only · {len(TARGET_SICS)} target SIC codes · "
+        f"{len(TARGET_COUNTRIES)} target countries · "
+        f"Nigeria / Pakistan / Turkey suppressed · "
+        f"{st.session_state.get('active_key_count', '?')} API key(s) rotating"
     )
 
     controls = render_sidebar()
-    st.session_state.active_target_countries = controls["selected_countries"]
 
     st.markdown(
-        f"**Active filters** — "
-        f"Query: `{controls['query'] or '—'}` · "
-        f"SICs: `{', '.join(sorted(controls['sic_filter'])) or 'all'}` · "
-        f"Target countries: `{', '.join(sorted(str(c) for c in controls['selected_countries'])) or 'none'}`"
+        f"**Incorporation from:** `{controls['incorporated_from'].strftime('%d %b %Y')}` · "
+        f"Cache token: `{st.session_state.refresh_token}` · "
+        f"Last refresh: `{st.session_state.last_refreshed_at or 'never'}`"
     )
     st.divider()
 
     if controls["run"]:
-        with st.spinner("Searching Companies House…"):
+        with st.spinner(f"Searching Companies House for companies incorporated from {controls['incorporated_from']}…"):
             try:
-                raw = api_search(controls["query"], controls["max_results"])
+                raw = api_search_by_incorporation_date(controls["incorporated_from"])
             except requests.HTTPError as exc:
-                st.error(f"Search request failed: {exc}")
+                st.error(f"Search failed: {exc}")
                 st.stop()
 
         if not raw:
-            st.warning("No companies returned. Try a broader search term.")
+            st.warning("No companies returned. Try an earlier incorporation date.")
         else:
-            if controls["sic_filter"]:
-                filtered = [r for r in raw if any(s in str(r) for s in controls["sic_filter"])]
-                if not filtered:
-                    filtered = raw
-                    st.info("SIC filter matched no snippets — showing all returned companies.")
-            else:
-                filtered = raw
-
-            st.session_state.results_df = enrich_all(filtered)
+            st.info(f"Found **{len(raw)}** raw results. Deduplicating, filtering, and enriching…")
+            st.session_state.results_df = enrich_all(raw)
 
     render_kpis(st.session_state.results_df)
     render_results(st.session_state.results_df)
