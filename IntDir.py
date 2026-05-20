@@ -39,7 +39,6 @@ TARGET_SICS: Set[str] = {
 }
 
 TECH_BIOTECH_SICS: Set[str] = {"62012", "72110"}
-
 OTHER_HIGH_VALUE_SICS: Set[str] = TARGET_SICS - TECH_BIOTECH_SICS
 
 TARGET_COUNTRIES: Set[str] = {
@@ -68,9 +67,16 @@ _COUNTRY_ALIASES: Dict[str, str] = {
     "people's republic of china": "china",
 }
 
-_LEGAL_KIND_MARKERS = ["corporate-entity", "legal-person", "firm", "super-secure"]
+_LEGAL_KIND_MARKERS = [
+    "corporate-entity",
+    "legal-person",
+    "firm",
+    "super-secure",
+]
+
 _CORPORATE_NAME_MARKERS = [
-    " ltd", " limited", " llp", " plc", " inc", " gmbh", " sarl", " bv", " ag", " oy", " spa", " srl"
+    " ltd", " limited", " llp", " plc", " inc", " gmbh", " sarl", " bv",
+    " ag", " oy", " spa", " srl"
 ]
 
 
@@ -107,7 +113,10 @@ def _load_all_disk_cache() -> Dict[str, Dict]:
 
 def _save_results(df: pd.DataFrame) -> None:
     if not df.empty:
-        RESULTS_FILE.write_text(df.to_json(orient="records", date_format="iso"), encoding="utf-8")
+        RESULTS_FILE.write_text(
+            df.to_json(orient="records", date_format="iso"),
+            encoding="utf-8",
+        )
 
 
 def _load_saved_results() -> pd.DataFrame:
@@ -148,6 +157,7 @@ def _get_http_session(api_key: str) -> requests.Session:
         s = requests.Session()
         s.auth = (api_key, "")
         s.headers.update({"Accept": "application/json"})
+
         retry = Retry(
             total=3,
             backoff_factor=0.3,
@@ -157,6 +167,7 @@ def _get_http_session(api_key: str) -> requests.Session:
         adapter = HTTPAdapter(max_retries=retry)
         s.mount("https://", adapter)
         HTTP_SESSIONS[api_key] = s
+
     return HTTP_SESSIONS[api_key]
 
 
@@ -174,6 +185,7 @@ def _init_session() -> None:
 
     if "results_df" not in st.session_state:
         loaded = _load_saved_results()
+
         required_cols = {
             "Timestamp": "",
             "Company Name": "",
@@ -186,6 +198,7 @@ def _init_session() -> None:
             "_added_at": "",
             "_cache_token": 0,
         }
+
         for col, default in required_cols.items():
             if col not in loaded.columns:
                 loaded[col] = default
@@ -250,18 +263,24 @@ def api_search_by_date(incorporated_on: date) -> List[Dict]:
                         "incorporated_from": date_str,
                         "incorporated_to": date_str,
                         "company_status": "active",
-                        "company_type": "private-limited-company,limited-liability-partnership",
+                        "company_type": "ltd,llp",
                         "sic_codes": sic,
-                        "items_per_page": 100,
+                        "size": 100,
                         "start_index": start,
                     },
                 )
-            except requests.HTTPError:
-                break
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    break
+                raise
 
             batch = data.get("items") or []
             results.extend(batch)
-            total = data.get("total_results", 0)
+
+            total = data.get("hits")
+            if total is None:
+                total = len(results)
+
             start += len(batch)
 
             if not batch or start >= total:
@@ -295,6 +314,7 @@ def api_pscs(cn: str) -> List[Dict]:
 def _psc_is_legal_entity(psc: Dict) -> bool:
     kind = str(psc.get("kind", "")).lower()
     name = str(psc.get("name", "")).strip().lower()
+    identification = psc.get("identification") or {}
 
     if any(marker in kind for marker in _LEGAL_KIND_MARKERS):
         return True
@@ -302,7 +322,6 @@ def _psc_is_legal_entity(psc: Dict) -> bool:
     if any(marker in f" {name}" for marker in _CORPORATE_NAME_MARKERS):
         return True
 
-    identification = psc.get("identification") or {}
     if identification.get("registration_number"):
         return True
 
@@ -317,7 +336,8 @@ def screen_pscs(pscs: List[Dict]) -> Dict:
         if _psc_is_legal_entity(psc):
             owned_by_company = True
 
-        if _is_target(psc.get("nationality")):
+        nationality = psc.get("nationality")
+        if _is_target(nationality):
             psc_target_country = True
 
     return {
@@ -329,11 +349,11 @@ def screen_pscs(pscs: List[Dict]) -> Dict:
 def screen_officers(officers: List[Dict]) -> Dict:
     director_target_residency = False
 
-    for o in officers:
-        if str(o.get("officer_role", "")).lower() != "director":
+    for officer in officers:
+        if str(officer.get("officer_role", "")).lower() != "director":
             continue
 
-        residence = o.get("country_of_residence")
+        residence = officer.get("country_of_residence") or officer.get("usual_residential_country")
         if _is_target(residence):
             director_target_residency = True
             break
@@ -364,7 +384,8 @@ def build_reason(sics: Set[str], psc: Dict, off: Dict, is_high_value: bool) -> s
 
 
 def match_sic_label(sics: Set[str]) -> str:
-    return ", ".join(sorted(sics & TARGET_SICS))
+    hits = sorted(sics & TARGET_SICS)
+    return ", ".join(hits)
 
 
 def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, sics: Set[str]) -> Dict:
@@ -429,8 +450,8 @@ def enrich_one(cn: str) -> Optional[Dict]:
 
     psc_flags = screen_pscs(pscs)
     off_flags = screen_officers(officers)
-    row = build_row(cn, profile, psc_flags, off_flags, sics)
 
+    row = build_row(cn, profile, psc_flags, off_flags, sics)
     st.session_state.disk_cache[cn] = row
     _write_disk_cache(cn, row)
     return row
@@ -469,9 +490,11 @@ def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
 
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(enrich_one, cn): cn for cn in to_fetch}
+
             for idx, future in enumerate(as_completed(futures), start=1):
                 progress.progress(idx / total)
                 status_el.caption(f"Enriching {idx} / {total} new companies…")
+
                 try:
                     row = future.result()
                     if row:
@@ -498,6 +521,7 @@ def render_sidebar() -> Dict[str, Any]:
             value=date.today(),
             max_value=date.today(),
         )
+
         st.caption(
             f"Searching active Private Ltd and LLP companies across {len(TARGET_SICS)} SIC codes."
         )
@@ -516,14 +540,20 @@ def render_sidebar() -> Dict[str, Any]:
 
         if clear:
             st.session_state.results_df = pd.DataFrame()
+
             if RESULTS_FILE.exists():
                 RESULTS_FILE.unlink()
+
             for f in DISK_CACHE_DIR.glob("*.json"):
                 f.unlink()
+
             st.session_state.disk_cache = {}
             st.success("Saved results and cache cleared.")
 
-    return {"incorporated_from": incorporated_from, "run": run}
+    return {
+        "incorporated_from": incorporated_from,
+        "run": run,
+    }
 
 
 def render_tables(df: pd.DataFrame) -> None:
