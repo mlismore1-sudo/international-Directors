@@ -2,7 +2,10 @@
 Companies House Screening Tool
 ================================
 Run:     streamlit run companies_house_screening.py
-Env var: COMPANIES_HOUSE_API_KEY=<your key>
+Env vars:
+    COMPANIES_HOUSE_API_KEY_1=<key one>
+    COMPANIES_HOUSE_API_KEY_2=<key two>
+    COMPANIES_HOUSE_API_KEY_3=<key three>
 Install: pip install streamlit requests pandas
 """
 
@@ -10,12 +13,11 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from itertools import cycle
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 import pandas as pd
 import requests
-
-# ── Streamlit is imported last so nothing above triggers Streamlit internals ──
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,11 +31,11 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS  (pure Python – no Streamlit calls here)
+# CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-COMPANIES_HOUSE_BASE = "https://api.company-information.service.gov.uk"
-REQUEST_TIMEOUT      = 20
-CACHE_TTL_SECONDS    = 43_200   # 12 hours
+COMPANIES_HOUSE_BASE  = "https://api.company-information.service.gov.uk"
+REQUEST_TIMEOUT       = 20
+CACHE_TTL_SECONDS     = 43_200   # 12 hours
 
 _DEFAULT_TARGET_COUNTRIES: Set[str] = {
     "nigeria", "pakistan", "turkey",
@@ -65,7 +67,45 @@ _CORPORATE_NAME_MARKERS: List[str] = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SESSION STATE  (called once inside main() before anything else runs)
+# API KEY ROTATION
+# Reads up to 3 keys from environment variables.
+# All 3 must be set; requests rotate through them round-robin so rate limits
+# are spread evenly across keys.
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_api_keys() -> List[str]:
+    keys = [
+        os.environ.get("COMPANIES_HOUSE_API_KEY_1", "").strip(),
+        os.environ.get("COMPANIES_HOUSE_API_KEY_2", "").strip(),
+        os.environ.get("COMPANIES_HOUSE_API_KEY_3", "").strip(),
+    ]
+    return [k for k in keys if k]
+
+
+def _get_key_rotator() -> Iterator[str]:
+    """Returns a persistent round-robin iterator stored in session state."""
+    if "key_rotator" not in st.session_state:
+        keys = _load_api_keys()
+        if not keys:
+            st.error(
+                "**No API keys found.**\n\n"
+                "Set at least one of the following environment variables before launching:\n"
+                "```\n"
+                "export COMPANIES_HOUSE_API_KEY_1=your_first_key\n"
+                "export COMPANIES_HOUSE_API_KEY_2=your_second_key\n"
+                "export COMPANIES_HOUSE_API_KEY_3=your_third_key\n"
+                "```"
+            )
+            st.stop()
+        st.session_state.key_rotator = cycle(keys)
+        st.session_state.active_key_count = len(keys)
+    return st.session_state.key_rotator
+
+
+def _next_key() -> str:
+    return next(_get_key_rotator())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 def _init_session() -> None:
     defaults: Dict[str, Any] = {
@@ -103,25 +143,29 @@ def _is_priority(value: Optional[str]) -> bool:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMPANIES HOUSE API HELPERS
+# Each call pulls the next key from the rotator automatically.
 # ─────────────────────────────────────────────────────────────────────────────
-def _session(api_key: str) -> requests.Session:
+def _make_session(api_key: str) -> requests.Session:
     s = requests.Session()
     s.auth = (api_key, "")
     s.headers.update({"Accept": "application/json"})
     return s
 
 
-def _get(api_key: str, url: str, params: Optional[Dict] = None) -> Dict:
-    resp = _session(api_key).get(url, params=params, timeout=REQUEST_TIMEOUT)
+def _get(url: str, params: Optional[Dict] = None) -> Dict:
+    """Single GET using the next key in rotation."""
+    api_key = _next_key()
+    resp    = _make_session(api_key).get(url, params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json() if resp.text.strip() else {}
 
 
-def _paginated(api_key: str, url: str, items_key: str = "items", page: int = 100) -> List[Dict]:
+def _paginated(url: str, items_key: str = "items", page: int = 100) -> List[Dict]:
+    """Paginated GET; each page request rotates to the next key."""
     out: List[Dict] = []
     start = 0
     while True:
-        data  = _get(api_key, url, {"items_per_page": page, "start_index": start})
+        data  = _get(url, {"items_per_page": page, "start_index": start})
         batch = data.get(items_key) or []
         out.extend(batch)
         if len(batch) < page:
@@ -131,26 +175,24 @@ def _paginated(api_key: str, url: str, items_key: str = "items", page: int = 100
     return out
 
 
-def api_search(api_key: str, query: str, max_results: int) -> List[Dict]:
+def api_search(query: str, max_results: int) -> List[Dict]:
     data = _get(
-        api_key,
         f"{COMPANIES_HOUSE_BASE}/search/companies",
         {"q": query, "items_per_page": min(max_results, 100)},
     )
     return data.get("items") or []
 
 
-def api_profile(api_key: str, cn: str) -> Dict:
-    return _get(api_key, f"{COMPANIES_HOUSE_BASE}/company/{cn}")
+def api_profile(cn: str) -> Dict:
+    return _get(f"{COMPANIES_HOUSE_BASE}/company/{cn}")
 
 
-def api_officers(api_key: str, cn: str) -> List[Dict]:
-    return _paginated(api_key, f"{COMPANIES_HOUSE_BASE}/company/{cn}/officers")
+def api_officers(cn: str) -> List[Dict]:
+    return _paginated(f"{COMPANIES_HOUSE_BASE}/company/{cn}/officers")
 
 
-def api_pscs(api_key: str, cn: str) -> List[Dict]:
+def api_pscs(cn: str) -> List[Dict]:
     return _paginated(
-        api_key,
         f"{COMPANIES_HOUSE_BASE}/company/{cn}/persons-with-significant-control",
     )
 
@@ -280,7 +322,7 @@ def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # CACHE-GUARDED ENRICHMENT
 # ─────────────────────────────────────────────────────────────────────────────
-def enrich_one(api_key: str, cn: str) -> Dict:
+def enrich_one(cn: str) -> Dict:
     cache = st.session_state.company_cache
     token = st.session_state.refresh_token
     entry = cache.get(cn)
@@ -288,9 +330,9 @@ def enrich_one(api_key: str, cn: str) -> Dict:
     if entry and entry.get("token") == token and (time.time() - entry["ts"]) < CACHE_TTL_SECONDS:
         return entry["data"]
 
-    profile  = api_profile(api_key, cn)
-    officers = api_officers(api_key, cn)
-    pscs     = api_pscs(api_key, cn)
+    profile  = api_profile(cn)
+    officers = api_officers(cn)
+    pscs     = api_pscs(cn)
 
     psc_flags = screen_pscs(pscs)
     off_flags = screen_officers(officers)
@@ -301,7 +343,7 @@ def enrich_one(api_key: str, cn: str) -> Dict:
     return row
 
 
-def enrich_all(api_key: str, search_rows: List[Dict]) -> pd.DataFrame:
+def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
     seen:   Set[str]  = set()
     unique: List[str] = []
     for r in search_rows:
@@ -322,7 +364,7 @@ def enrich_all(api_key: str, search_rows: List[Dict]) -> pd.DataFrame:
     for idx, cn in enumerate(unique, 1):
         status.caption(f"Enriching {idx} / {total} — {cn}")
         try:
-            rows.append(enrich_one(api_key, cn))
+            rows.append(enrich_one(cn))
         except requests.HTTPError as exc:
             rows.append({
                 "company_number": cn, "company_name": "", "status": "",
@@ -380,7 +422,9 @@ def render_sidebar() -> Dict[str, Any]:
             st.success(f"Cache cleared — token is now {st.session_state.refresh_token}.")
 
         st.divider()
+        key_count = st.session_state.get("active_key_count", "—")
         st.caption(
+            f"🔑 API keys loaded: `{key_count}`  \n"
             f"Cache token: `{st.session_state.refresh_token}`  \n"
             f"Last manual refresh: {st.session_state.last_refreshed_at or 'never this session'}"
         )
@@ -398,11 +442,11 @@ def render_kpis(df: pd.DataFrame) -> None:
     c1, c2, c3, c4, c5 = st.columns(5)
     def _n(col: str) -> int:
         return int(df[col].sum()) if (not df.empty and col in df.columns) else 0
-    c1.metric("Companies",               len(df))
-    c2.metric("PSC legal entities",      _n("psc_legal_entity_flag"))
-    c3.metric("PSC nationality flags",   _n("psc_nationality_flag"))
+    c1.metric("Companies",                len(df))
+    c2.metric("PSC legal entities",       _n("psc_legal_entity_flag"))
+    c3.metric("PSC nationality flags",    _n("psc_nationality_flag"))
     c4.metric("Director residency flags", _n("director_residency_flag"))
-    c5.metric("Publishable",             _n("should_publish"))
+    c5.metric("Publishable",              _n("should_publish"))
 
 
 _DISPLAY_COLS = [
@@ -428,8 +472,8 @@ def render_results(df: pd.DataFrame) -> None:
     n_pub  = int(df["should_publish"].sum())     if "should_publish"     in df.columns else 0
     n_pri  = int(df["priority_exception"].sum()) if "priority_exception" in df.columns else 0
     mask   = (
-        ~df.get("psc_legal_entity_flag",  pd.Series(False, index=df.index)).astype(bool)
-        & ~df.get("psc_nationality_flag", pd.Series(False, index=df.index)).astype(bool)
+        ~df.get("psc_legal_entity_flag",    pd.Series(False, index=df.index)).astype(bool)
+        & ~df.get("psc_nationality_flag",   pd.Series(False, index=df.index)).astype(bool)
         & ~df.get("director_residency_flag", pd.Series(False, index=df.index)).astype(bool)
     )
     n_none = int(mask.sum())
@@ -481,22 +525,14 @@ def render_rules() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     _init_session()
+    _get_key_rotator()  # validates keys immediately on load
 
     st.title("🏢 Companies House Screening Tool")
     st.caption(
         "Flags PSC legal entities · PSC nationality · director residency  |  "
-        "SIC 62012 and 72110 always published unless Nigeria, Pakistan, or Turkey is detected."
+        "SIC 62012 and 72110 always published unless Nigeria, Pakistan, or Turkey is detected.  |  "
+        f"Running with {st.session_state.get('active_key_count', '?')} API key(s) in rotation."
     )
-
-    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
-    if not api_key:
-        st.error(
-            "**API key missing.**\n\n"
-            "Set your Companies House key before launching:\n"
-            "```\nexport COMPANIES_HOUSE_API_KEY=your_key_here\n"
-            "streamlit run companies_house_screening.py\n```"
-        )
-        st.stop()
 
     controls = render_sidebar()
     st.session_state.active_target_countries = controls["selected_countries"]
@@ -512,7 +548,7 @@ def main() -> None:
     if controls["run"]:
         with st.spinner("Searching Companies House…"):
             try:
-                raw = api_search(api_key, controls["query"], controls["max_results"])
+                raw = api_search(controls["query"], controls["max_results"])
             except requests.HTTPError as exc:
                 st.error(f"Search request failed: {exc}")
                 st.stop()
@@ -528,7 +564,7 @@ def main() -> None:
             else:
                 filtered = raw
 
-            st.session_state.results_df = enrich_all(api_key, filtered)
+            st.session_state.results_df = enrich_all(filtered)
 
     render_kpis(st.session_state.results_df)
     render_results(st.session_state.results_df)
