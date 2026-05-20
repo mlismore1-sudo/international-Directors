@@ -39,12 +39,30 @@ TARGET_SICS: Set[str] = {
 }
 
 TECH_BIOTECH_SICS: Set[str] = {"62012", "72110"}
-OTHER_HIGH_VALUE_SICS: Set[str] = TARGET_SICS - TECH_BIOTECH_SICS
 
 TARGET_COUNTRIES: Set[str] = {
-    "china", "france", "germany", "belgium", "netherlands", "spain", "portugal",
-    "lithuania", "poland", "norway", "finland", "denmark", "sweden",
-    "united states", "india", "singapore", "hong kong",
+    "usa",
+    "united states",
+    "united states of america",
+    "france",
+    "germany",
+    "poland",
+    "norway",
+    "sweden",
+    "spain",
+    "portugal",
+    "belgium",
+    "netherlands",
+    "denmark",
+    "finland",
+    "italy",
+    "greece",
+    "ireland",
+    "india",
+    "croatia",
+    "hong kong",
+    "china",
+    "singapore",
 }
 
 ACCEPTED_COMPANY_TYPES: Set[str] = {
@@ -60,8 +78,10 @@ _COUNTRY_ALIASES: Dict[str, str] = {
     "us": "united states",
     "united states of america": "united states",
     "hk": "hong kong",
+    "hong-kong": "hong kong",
     "holland": "netherlands",
     "the netherlands": "netherlands",
+    "nertherlands": "netherlands",
     "prc": "china",
     "peoples republic of china": "china",
     "people's republic of china": "china",
@@ -213,6 +233,7 @@ def _normalise(value: Optional[str]) -> str:
     if not value:
         return ""
     cleaned = re.sub(r"\s+", " ", str(value).strip().lower())
+    cleaned = cleaned.replace("-", " ")
     return _COUNTRY_ALIASES.get(cleaned, cleaned)
 
 
@@ -363,22 +384,25 @@ def screen_officers(officers: List[Dict]) -> Dict:
     }
 
 
-def build_reason(sics: Set[str], psc: Dict, off: Dict, is_high_value: bool) -> str:
+def is_flagged_company(psc_flags: Dict, off_flags: Dict) -> bool:
+    return bool(
+        off_flags["director_target_residency"]
+        or psc_flags["psc_target_country"]
+        or psc_flags["owned_by_company"]
+    )
+
+
+def build_reason(psc: Dict, off: Dict) -> str:
     reasons: List[str] = []
 
-    if sics & TECH_BIOTECH_SICS:
-        reasons.append("SIC Match")
+    if off["director_target_residency"]:
+        reasons.append("🌍 Director resident in target country")
 
-    if off["director_target_residency"] or psc["psc_target_country"]:
-        reasons.append("🌍 Country Match")
+    if psc["psc_target_country"]:
+        reasons.append("🌍 PSC nationality in target country")
 
     if psc["owned_by_company"]:
-        reasons.append("👨‍👧 Owned by Another Company")
-
-    if is_high_value and not reasons:
-        other_hits = sorted(sics & OTHER_HIGH_VALUE_SICS)
-        if other_hits:
-            reasons.append(f"High Value SIC: {', '.join(other_hits)}")
+        reasons.append("👨‍👧 PSC is another company")
 
     return " | ".join(reasons)
 
@@ -388,25 +412,24 @@ def match_sic_label(sics: Set[str]) -> str:
     return ", ".join(hits)
 
 
-def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, sics: Set[str]) -> Dict:
-    tech_hit = bool(sics & TECH_BIOTECH_SICS)
-    other_high_value_hit = bool(sics & OTHER_HIGH_VALUE_SICS)
-    country_match = off["director_target_residency"] or psc["psc_target_country"]
-    owned_by_company = psc["owned_by_company"]
+def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, sics: Set[str]) -> Optional[Dict]:
+    flagged = is_flagged_company(psc, off)
+    if not flagged:
+        return None
 
-    is_tech_biotech = tech_hit
-    is_high_value = other_high_value_hit or (tech_hit and (country_match or owned_by_company))
+    matched_target_sics = sics & TARGET_SICS
+    is_tech_biotech = bool(matched_target_sics & TECH_BIOTECH_SICS)
 
     now_utc = datetime.utcnow()
 
     return {
         "Timestamp": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "Company Name": profile.get("company_name", ""),
-        "Reason": build_reason(sics, psc, off, is_high_value),
-        "Matched SIC": match_sic_label(sics),
-        "SIC Codes": ", ".join(sorted(sics & TARGET_SICS)),
+        "Reason": build_reason(psc, off),
+        "Matched SIC": match_sic_label(matched_target_sics),
+        "SIC Codes": ", ".join(sorted(matched_target_sics)),
         "Tech & Biotech": is_tech_biotech,
-        "High Value Lead": is_high_value,
+        "High Value Lead": True,
         "_company_number": cn,
         "_added_at": now_utc.isoformat(),
         "_cache_token": st.session_state.refresh_token,
@@ -452,6 +475,9 @@ def enrich_one(cn: str) -> Optional[Dict]:
     off_flags = screen_officers(officers)
 
     row = build_row(cn, profile, psc_flags, off_flags, sics)
+    if row is None:
+        return None
+
     st.session_state.disk_cache[cn] = row
     _write_disk_cache(cn, row)
     return row
@@ -493,7 +519,7 @@ def enrich_all(search_rows: List[Dict]) -> pd.DataFrame:
 
             for idx, future in enumerate(as_completed(futures), start=1):
                 progress.progress(idx / total)
-                status_el.caption(f"Enriching {idx} / {total} new companies…")
+                status_el.caption(f"Checking {idx} / {total} companies…")
 
                 try:
                     row = future.result()
@@ -558,7 +584,7 @@ def render_sidebar() -> Dict[str, Any]:
 
 def render_tables(df: pd.DataFrame) -> None:
     if df.empty:
-        st.info("No results yet — choose a date and run the search.")
+        st.info("No flagged companies yet — choose a date and run the search.")
         return
 
     tech = df[df["Tech & Biotech"] == True].copy()
@@ -581,7 +607,7 @@ def render_tables(df: pd.DataFrame) -> None:
     )
 
     st.download_button(
-        "⬇ Download all results as CSV",
+        "⬇ Download flagged results as CSV",
         data=df.to_csv(index=False).encode("utf-8"),
         file_name="ch_screening_results.csv",
         mime="text/csv",
@@ -594,7 +620,7 @@ def main() -> None:
 
     st.title("🏢 Companies House Screening Tool")
     st.caption(
-        "Two outputs: Tech & Biotech and High Value Leads. Results stay cached unless you use Refresh cache."
+        "Flags companies in the selected SIC codes where a target-country director, target-nationality PSC, or corporate PSC is found."
     )
 
     controls = render_sidebar()
@@ -613,10 +639,12 @@ def main() -> None:
         if not raw:
             st.warning("No companies returned for that date.")
         else:
-            st.info(f"Found {len(raw)} raw results. Checking cache and enriching companies…")
+            st.info(f"Found {len(raw)} raw results. Enriching and applying flag rules…")
             new_df = enrich_all(raw)
 
-            if not new_df.empty:
+            if new_df.empty:
+                st.warning("No companies matched the director / PSC flag criteria.")
+            else:
                 existing = st.session_state.results_df
 
                 if not existing.empty and "_company_number" in existing.columns:
@@ -629,7 +657,7 @@ def main() -> None:
 
                 st.session_state.results_df = combined
                 _save_results(combined)
-                st.success(f"Done. {len(new_df)} companies processed.")
+                st.success(f"Done. {len(new_df)} flagged companies found.")
 
     render_tables(st.session_state.results_df)
 
