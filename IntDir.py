@@ -373,7 +373,8 @@ def screen_pscs(pscs: List[Dict]) -> Dict:
 
 
 def screen_officers(officers: List[Dict]) -> Dict:
-    target_directors: List[str] = []
+    target_nat:    List[str] = []
+    target_res:    List[str] = []
     excluded_found = False
 
     for o in officers:
@@ -381,15 +382,19 @@ def screen_officers(officers: List[Dict]) -> Dict:
             continue
         res = o.get("country_of_residence") or o.get("usual_residential_country")
         nat = o.get("nationality")
-        hit = res if _is_target(res) else (nat if _is_target(nat) else None)
-        if hit:
-            target_directors.append(f"{o.get('name', 'Unknown')} ({hit})")
+        name = o.get("name", "Unknown")
+        if _is_target(nat):
+            target_nat.append(f"{name} ({nat})")
+        if _is_target(res):
+            target_res.append(f"{name} ({res})")
         if _is_excluded(res) or _is_excluded(nat):
             excluded_found = True
 
     return {
-        "director_from_target_country": bool(target_directors),
-        "director_target_details":      "; ".join(target_directors),
+        "director_target_nationality":  bool(target_nat),
+        "director_nat_details":         "; ".join(target_nat),
+        "director_target_residency":    bool(target_res),
+        "director_res_details":         "; ".join(target_res),
         "director_excluded":            excluded_found,
     }
 
@@ -400,7 +405,7 @@ def decide_publish(psc: Dict, officers: Dict, sic_codes: Set[str]) -> Dict:
     any_flag       = (
         psc["owned_by_company"]
         or psc["psc_from_target_country"]
-        or officers["director_from_target_country"]
+        or officers["director_target_nationality"] or officers["director_target_residency"]
     )
 
     if excluded:
@@ -417,7 +422,8 @@ def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
     return {
         "Company Name":              profile.get("company_name", ""),
         "SIC Codes":                 ", ".join(map(str, sics)),
-        "Director from Target Country": "🌍 " + off["director_target_details"] if off["director_from_target_country"] else "—",
+        "Director Nationality":         "🌍 " + off["director_nat_details"] if off["director_target_nationality"] else "—",
+        "Director Residency":           "🌍 " + off["director_res_details"] if off["director_target_residency"] else "—",
         "Owned by Another Company":  "👨‍👧 " + psc["owning_company_names"] if psc["owned_by_company"] else "No",
         "PSC from Target Country":   "🌍 " + psc["psc_target_details"] if psc["psc_from_target_country"] else "—",
         "Publishable":               "✅ Yes" if pub["should_publish"] else "❌ No",
@@ -603,19 +609,20 @@ def render_kpis(df: pd.DataFrame) -> None:
     publishable = int((df["Publishable"] == "✅ Yes").sum()) if "Publishable" in df.columns else 0
     owned_co    = int(df["Owned by Another Company"].str.startswith("👨").sum()) if "Owned by Another Company" in df.columns else 0
     psc_target  = int((df["PSC from Target Country"] != "—").sum()) if "PSC from Target Country" in df.columns else 0
-    dir_target  = int((df["Director from Target Country"] != "—").sum()) if "Director from Target Country" in df.columns else 0
+    dir_target  = int(((df.get("Director Nationality", "—") != "—") | (df.get("Director Residency", "—") != "—")).sum())
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Companies screened",         len(df))
     c2.metric("Publishable",                publishable)
     c3.metric("Owned by a company",         owned_co)
     c4.metric("PSC target country",         psc_target)
-    c5.metric("Director target nationality",dir_target)
+    c5.metric("Director target match", dir_target)
 
 
 _TABLE_COLS = [
     "Company Name",
-    "Director from Target Country",
+    "Director Nationality",
+    "Director Residency",
     "Owned by Another Company",
     "PSC from Target Country",
     "SIC Codes",
@@ -649,9 +656,9 @@ def render_results(df: pd.DataFrame) -> None:
         view = view[view["Owned by Another Company"] == "No"]
 
     if show_target == "Target nationality present":
-        view = view[(view["PSC from Target Country"] != "—") | (view["Director from Target Country"] != "—")]
+        view = view[(view["PSC from Target Country"] != "—") | (view["Director Nationality"] != "—") | (view["Director Residency"] != "—")]
     elif show_target == "No target nationality":
-        view = view[(view["PSC from Target Country"] == "—") & (view["Director from Target Country"] == "—")]
+        view = view[(view["PSC from Target Country"] == "—") & (view["Director Nationality"] == "—") & (view["Director Residency"] == "—")]
 
     cols = [c for c in _TABLE_COLS if c in view.columns]
     st.dataframe(view[cols], use_container_width=True, height=560)
