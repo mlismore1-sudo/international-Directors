@@ -123,12 +123,6 @@ def classify_sector(sic_codes: List[str]) -> Optional[str]:
     return ", ".join(matched_codes) if matched_codes else None
 
 
-def parse_sector_codes(sector_value: str) -> set[str]:
-    if not sector_value:
-        return set()
-    return {code.strip() for code in str(sector_value).split(",") if code.strip()}
-
-
 def clean_country(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -142,6 +136,31 @@ def normalize_country(value: Optional[str]) -> str:
 
 def is_uk_country(value: Optional[str]) -> bool:
     return clean_country(value) in UK_COUNTRY_ALIASES
+
+
+def get_mode_labels(screening_mode: str) -> Dict[str, str]:
+    if screening_mode == "PSC":
+        return {
+            "flag_col": "director_countries_flagged",
+            "match_col": "matched_director_countries",
+            "uk_col": "uk_director",
+            "source_name": "Persons with Significant Control",
+            "short_source_name": "PSC",
+            "uk_label": "UK PSC",
+            "flag_label": "PSC Countries Flagged",
+            "match_label": "Matched PSC Countries",
+        }
+
+    return {
+        "flag_col": "director_countries_flagged",
+        "match_col": "matched_director_countries",
+        "uk_col": "uk_director",
+        "source_name": "Directors",
+        "short_source_name": "Director",
+        "uk_label": "UK Director",
+        "flag_label": "Director Countries Flagged",
+        "match_label": "Matched Director Countries",
+    }
 
 
 @st.cache_resource(show_spinner=False)
@@ -318,19 +337,91 @@ def fetch_director_screening_cached(company_number: str, api_keys_tuple: tuple[s
     return "No", "", "Yes" if has_uk_director else "No"
 
 
-def fetch_director_screening_fresh(company_number: str, api_keys: List[str]) -> Tuple[str, str, str]:
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_psc_screening_cached(company_number: str, api_keys_tuple: tuple[str, ...]) -> Tuple[str, str, str]:
+    api_keys = list(api_keys_tuple)
+    url = f"https://api.company-information.service.gov.uk/company/{company_number}/persons-with-significant-control"
+    start_index = 0
+    items_per_page = 100
+    matched_countries = set()
+    has_uk_psc = False
+
+    while True:
+        params = {
+            "items_per_page": str(items_per_page),
+            "start_index": str(start_index),
+            "register_view": "true",
+        }
+
+        try:
+            response = fetch_with_rotation(
+                url=url,
+                params=params,
+                api_keys=api_keys,
+                allow_not_found=True,
+            )
+
+            if response.status_code == 404:
+                return "No", "", "No"
+
+            payload = response.json()
+            items = payload.get("items", []) or []
+
+            for psc in items:
+                if psc.get("ceased"):
+                    continue
+
+                country_of_residence = psc.get("country_of_residence", "")
+                normalized_country = normalize_country(country_of_residence)
+                if normalized_country:
+                    matched_countries.add(normalized_country)
+                if is_uk_country(country_of_residence):
+                    has_uk_psc = True
+
+            total_results = int(payload.get("total_results", len(items)))
+            start_index += len(items)
+
+            if not items or start_index >= total_results:
+                break
+
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (400, 403, 404):
+                return "No", "", "No"
+            raise
+
+        except requests.RequestException:
+            return "No", "", "No"
+
+    if matched_countries:
+        return "Yes", ", ".join(sorted(matched_countries)), "Yes" if has_uk_psc else "No"
+    return "No", "", "Yes" if has_uk_psc else "No"
+
+
+def fetch_screening_cached(company_number: str, api_keys: List[str], screening_mode: str) -> Tuple[str, str, str]:
+    if screening_mode == "PSC":
+        return fetch_psc_screening_cached(company_number, tuple(api_keys))
+    return fetch_director_screening_cached(company_number, tuple(api_keys))
+
+
+def fetch_screening_fresh(company_number: str, api_keys: List[str], screening_mode: str) -> Tuple[str, str, str]:
+    if screening_mode == "PSC":
+        fetch_psc_screening_cached.clear()
+        return fetch_psc_screening_cached(company_number, tuple(api_keys))
     fetch_director_screening_cached.clear()
     return fetch_director_screening_cached(company_number, tuple(api_keys))
 
 
-def get_store_paths(run_date: str) -> Tuple[Path, Path]:
-    snapshot_path = DATA_DIR / f"companies_{run_date}.csv"
-    seen_path = DATA_DIR / f"seen_{run_date}.csv"
+def get_store_paths(run_date: str, screening_mode: str) -> Tuple[Path, Path]:
+    mode_suffix = screening_mode.strip().lower()
+    snapshot_path = DATA_DIR / f"companies_{mode_suffix}_{run_date}.csv"
+    seen_path = DATA_DIR / f"seen_{mode_suffix}_{run_date}.csv"
     return snapshot_path, seen_path
 
 
-def lead_file_path(person: str, run_date: str) -> Path:
-    return LEADS_DIR / f"{person.strip().lower()}_leads_{run_date}.csv"
+def lead_file_path(person: str, run_date: str, screening_mode: str) -> Path:
+    mode_suffix = screening_mode.strip().lower()
+    return LEADS_DIR / f"{person.strip().lower()}_{mode_suffix}_leads_{run_date}.csv"
 
 
 @st.cache_data(show_spinner=False)
@@ -374,8 +465,8 @@ def load_results(path: Path) -> pd.DataFrame:
     return load_results_csv(str(path), mtime)
 
 
-def load_leads(person: str, run_date: str) -> pd.DataFrame:
-    path = lead_file_path(person, run_date)
+def load_leads(person: str, run_date: str, screening_mode: str) -> pd.DataFrame:
+    path = lead_file_path(person, run_date, screening_mode)
     mtime = path.stat().st_mtime if path.exists() else 0.0
     return load_leads_csv(str(path), mtime)
 
@@ -403,8 +494,14 @@ def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -
     load_results_csv.clear()
 
 
-def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_leads: pd.DataFrame) -> bool:
-    path = lead_file_path(person, run_date)
+def add_company_to_leads(
+    person: str,
+    run_date: str,
+    screening_mode: str,
+    row: pd.Series,
+    existing_leads: pd.DataFrame,
+) -> bool:
+    path = lead_file_path(person, run_date, screening_mode)
     company_number = str(row.get("company_number", "")).strip()
     if not company_number:
         return False
@@ -488,6 +585,7 @@ def screen_only_new_companies(
     fetched_df: pd.DataFrame,
     existing_df: pd.DataFrame,
     api_keys: List[str],
+    screening_mode: str,
 ) -> pd.DataFrame:
     if fetched_df.empty:
         return fetched_df.copy()
@@ -552,9 +650,10 @@ def screen_only_new_companies(
 
         for company_number in new_company_numbers:
             try:
-                flags_lookup[company_number] = fetch_director_screening_cached(
+                flags_lookup[company_number] = fetch_screening_cached(
                     company_number,
-                    tuple(api_keys),
+                    api_keys,
+                    screening_mode,
                 )
             except Exception:
                 flags_lookup[company_number] = ("No", "", "No")
@@ -578,7 +677,13 @@ def screen_only_new_companies(
     )
 
 
-def rescreen_company_in_state(company_number: str, api_keys: List[str], snapshot_path: Path, seen_path: Path) -> bool:
+def rescreen_company_in_state(
+    company_number: str,
+    api_keys: List[str],
+    snapshot_path: Path,
+    seen_path: Path,
+    screening_mode: str,
+) -> bool:
     latest_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
     if latest_df.empty:
         return False
@@ -590,13 +695,13 @@ def rescreen_company_in_state(company_number: str, api_keys: List[str], snapshot
         return False
 
     try:
-        flagged, matched_countries, uk_director = fetch_director_screening_fresh(company_number, api_keys)
+        flagged, matched_countries, uk_present = fetch_screening_fresh(company_number, api_keys, screening_mode)
     except Exception:
         return False
 
     working_df.loc[match_mask, "director_countries_flagged"] = flagged
     working_df.loc[match_mask, "matched_director_countries"] = matched_countries
-    working_df.loc[match_mask, "uk_director"] = uk_director
+    working_df.loc[match_mask, "uk_director"] = uk_present
 
     working_df = add_derived_columns(working_df)
     working_df = get_sorted_current_df(working_df)
@@ -607,7 +712,14 @@ def rescreen_company_in_state(company_number: str, api_keys: List[str], snapshot
     return True
 
 
-def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
+def render_quick_add(
+    df: pd.DataFrame,
+    person: str,
+    run_date: str,
+    screening_mode: str,
+    existing_leads: pd.DataFrame,
+    labels: Dict[str, str],
+) -> None:
     st.subheader(f"Quick add to {person}'s leads")
 
     if df.empty:
@@ -630,10 +742,11 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
         if already_added:
             c6.caption("Added")
         else:
-            if c6.button("Add", key=f"add_{person}_{company_number}_{idx}"):
+            if c6.button("Add", key=f"add_{screening_mode}_{person}_{company_number}_{idx}"):
                 added = add_company_to_leads(
                     person,
                     run_date,
+                    screening_mode,
                     pd.Series({
                         "company_number": row.company_number,
                         "company_name": row.company_name,
@@ -648,8 +761,14 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
                     st.rerun()
 
 
-def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: Path) -> None:
-    with st.expander("Manual re-screen", expanded=False):
+def render_manual_rescreen(
+    api_keys: List[str],
+    snapshot_path: Path,
+    seen_path: Path,
+    screening_mode: str,
+    labels: Dict[str, str],
+) -> None:
+    with st.expander(f"Manual re-screen ({labels['short_source_name']})", expanded=False):
         latest_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
         if latest_df.empty:
             st.info("No companies available to re-screen yet.")
@@ -661,12 +780,12 @@ def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: 
 
         total_to_rescreen = len(unscreened_df)
         if total_to_rescreen == 0:
-            st.success("All companies currently shown have already been identified with a target country director.")
+            st.success(f"All companies currently shown have already been identified with a target {labels['short_source_name']} country.")
             return
 
-        st.write(f"Companies available for one-click re-screen: **{total_to_rescreen}**")
+        st.write(f"Companies available for one-click re-screen using {labels['source_name']}: **{total_to_rescreen}**")
 
-        if st.button("Re-screen all non-flagged companies", key="manual_rescreen_button"):
+        if st.button(f"Re-screen all non-flagged companies using {labels['short_source_name']}", key=f"manual_rescreen_button_{screening_mode}"):
             working_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS)).copy()
             if working_df.empty:
                 st.error("Unable to load companies for re-screening right now.")
@@ -676,14 +795,18 @@ def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: 
             company_numbers = unscreened_df["company_number"].astype(str).str.strip().tolist()
             updated_count = 0
 
-            fetch_director_screening_cached.clear()
+            if screening_mode == "PSC":
+                fetch_psc_screening_cached.clear()
+            else:
+                fetch_director_screening_cached.clear()
 
-            with st.spinner(f"Re-screening {total_to_rescreen} non-flagged companies..."):
+            with st.spinner(f"Re-screening {total_to_rescreen} non-flagged companies using {labels['source_name']}..."):
                 for company_number in company_numbers:
                     try:
-                        flagged, matched_countries, uk_director = fetch_director_screening_cached(
+                        flagged, matched_countries, uk_present = fetch_screening_cached(
                             company_number,
-                            tuple(api_keys),
+                            api_keys,
+                            screening_mode,
                         )
                     except Exception:
                         continue
@@ -694,7 +817,7 @@ def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: 
 
                     working_df.loc[match_mask, "director_countries_flagged"] = flagged
                     working_df.loc[match_mask, "matched_director_countries"] = matched_countries
-                    working_df.loc[match_mask, "uk_director"] = uk_director
+                    working_df.loc[match_mask, "uk_director"] = uk_present
                     updated_count += 1
 
             if updated_count == 0:
@@ -707,8 +830,16 @@ def render_manual_rescreen(api_keys: List[str], snapshot_path: Path, seen_path: 
 
             st.session_state["latest_df"] = working_df
             st.session_state["sorted_df"] = working_df
-            st.success(f"Re-screened {updated_count} non-flagged companies using fresh Companies House officer data.")
+            st.success(f"Re-screened {updated_count} non-flagged companies using fresh {labels['source_name']} data.")
             st.rerun()
+
+
+def set_director_mode() -> None:
+    st.session_state["screening_mode"] = "Director"
+
+
+def set_psc_mode() -> None:
+    st.session_state["screening_mode"] = "PSC"
 
 
 def main() -> None:
@@ -720,19 +851,48 @@ def main() -> None:
         st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
         st.stop()
 
+    if "screening_mode" not in st.session_state:
+        st.session_state["screening_mode"] = "Director"
+
+    screening_mode = st.session_state["screening_mode"]
+    labels = get_mode_labels(screening_mode)
+
     run_date = today_uk_str()
-    snapshot_path, seen_path = get_store_paths(run_date)
+    snapshot_path, seen_path = get_store_paths(run_date, screening_mode)
 
     st.sidebar.header("Controls")
     selected_user = st.sidebar.selectbox("Working as", TEAM_MEMBERS, index=0)
-    show_flagged_only = st.sidebar.checkbox("Show only flagged director countries", value=True)
+    show_flagged_only = st.sidebar.checkbox("Show only flagged country matches", value=True)
+
+    st.sidebar.subheader("Screening source")
+    c_mode_1, c_mode_2 = st.sidebar.columns(2)
+    with c_mode_1:
+        st.button(
+            "Use Director Screening",
+            key="director_mode_button",
+            on_click=set_director_mode,
+            use_container_width=True,
+        )
+    with c_mode_2:
+        st.button(
+            "Use PSC Screening",
+            key="psc_mode_button",
+            on_click=set_psc_mode,
+            use_container_width=True,
+        )
+
+    screening_mode = st.session_state["screening_mode"]
+    labels = get_mode_labels(screening_mode)
+    snapshot_path, seen_path = get_store_paths(run_date, screening_mode)
+
+    st.sidebar.caption(f"Current mode: {labels['source_name']}")
     refresh = st.sidebar.button("Refresh now", type="primary")
 
     if refresh or not snapshot_path.exists():
-        with st.spinner("Refreshing Companies House data..."):
+        with st.spinner(f"Refreshing Companies House data using {labels['source_name']}..."):
             fetched_df = fetch_companies_incorporated_today(tuple(api_keys), run_date)
             existing_df = load_results(snapshot_path)
-            screened_df = screen_only_new_companies(fetched_df, existing_df, api_keys)
+            screened_df = screen_only_new_companies(fetched_df, existing_df, api_keys, screening_mode)
             screened_df = add_derived_columns(screened_df)
 
             seen_df = load_results(seen_path)
@@ -748,14 +908,14 @@ def main() -> None:
         current_df = load_results(snapshot_path)
         current_df = add_derived_columns(current_df)
 
-        st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault("sorted_df", get_sorted_current_df(current_df))
+        st.session_state["latest_df"] = current_df
+        st.session_state["sorted_df"] = get_sorted_current_df(current_df)
         st.session_state.setdefault("new_df", pd.DataFrame(columns=RESULT_COLUMNS))
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
     current_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
     sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
-    leads_df = load_leads(selected_user, run_date)
+    leads_df = load_leads(selected_user, run_date, screening_mode)
 
     tech_biotech_df, matched_country_directors_df = split_result_tables(sorted_df)
 
@@ -772,17 +932,20 @@ def main() -> None:
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total pulled today", total_pulled)
-    c2.metric("Flagged by director country", total_flagged)
+    c2.metric(f"Flagged by {labels['short_source_name']} country", total_flagged)
     c3.metric(f"{selected_user}'s leads today", total_leads)
 
-    st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
+    st.caption(
+        f"Working as {selected_user} | Screening source: {labels['source_name']} | "
+        f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}"
+    )
 
-    render_manual_rescreen(api_keys, snapshot_path, seen_path)
+    render_manual_rescreen(api_keys, snapshot_path, seen_path, screening_mode, labels)
 
     newest_df = matched_country_directors_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True)
-    render_quick_add(newest_df, selected_user, run_date, leads_df)
+    render_quick_add(newest_df, selected_user, run_date, screening_mode, leads_df, labels)
 
-    with st.expander("Tech & Biotech Leads", expanded=True):
+    with st.expander(f"Tech & Biotech Leads ({labels['short_source_name']} mode)", expanded=True):
         if tech_biotech_df.empty:
             st.info("No tech or biotech leads to show yet.")
         else:
@@ -797,17 +960,17 @@ def main() -> None:
             ]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "SIC Code(s)",
-                "uk_director": "UK Director",
-                "director_countries_flagged": "Director Countries Flagged",
-                "matched_director_countries": "Matched Director Countries",
-                "tech_biotech_international_match": "Tech/Biotech International Match",
+                "uk_director": labels["uk_label"],
+                "director_countries_flagged": labels["flag_label"],
+                "matched_director_countries": labels["match_label"],
+                "tech_biotech_international_match": f"Tech/Biotech {labels['short_source_name']} International Match",
                 "time_added_to_table": "Time Added To Table",
             })
             st.dataframe(tech_biotech_display, use_container_width=True, hide_index=True)
 
-    with st.expander("Matched Country Directors", expanded=False):
+    with st.expander(f"Matched Country Results ({labels['short_source_name']} mode)", expanded=False):
         if matched_country_directors_df.empty:
-            st.info("No matched country director companies to show yet.")
+            st.info("No matched country companies to show yet.")
         else:
             matched_display = matched_country_directors_df[[
                 "company_name",
@@ -819,9 +982,9 @@ def main() -> None:
             ]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "SIC Code(s)",
-                "uk_director": "UK Director",
-                "director_countries_flagged": "Director Countries Flagged",
-                "matched_director_countries": "Matched Director Countries",
+                "uk_director": labels["uk_label"],
+                "director_countries_flagged": labels["flag_label"],
+                "matched_director_countries": labels["match_label"],
                 "time_added_to_table": "Time Added To Table",
             })
             st.dataframe(matched_display, use_container_width=True, hide_index=True)
@@ -832,20 +995,20 @@ def main() -> None:
         else:
             if not tech_biotech_df.empty:
                 st.download_button(
-                    label="Download tech & biotech leads CSV",
+                    label=f"Download tech & biotech leads CSV ({labels['short_source_name']} mode)",
                     data=tech_biotech_display.to_csv(index=False).encode("utf-8"),
-                    file_name=f"tech_biotech_leads_{run_date}.csv",
+                    file_name=f"tech_biotech_leads_{screening_mode.lower()}_{run_date}.csv",
                     mime="text/csv",
-                    key="download_tech_biotech_csv",
+                    key=f"download_tech_biotech_csv_{screening_mode}",
                 )
 
             if not matched_country_directors_df.empty:
                 st.download_button(
-                    label="Download matched country directors CSV",
+                    label=f"Download matched country results CSV ({labels['short_source_name']} mode)",
                     data=matched_display.to_csv(index=False).encode("utf-8"),
-                    file_name=f"matched_country_directors_{run_date}.csv",
+                    file_name=f"matched_country_results_{screening_mode.lower()}_{run_date}.csv",
                     mime="text/csv",
-                    key="download_matched_country_directors_csv",
+                    key=f"download_matched_country_directors_csv_{screening_mode}",
                 )
 
 
