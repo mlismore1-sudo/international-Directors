@@ -432,6 +432,7 @@ def build_row(cn: str, profile: Dict, psc: Dict, off: Dict, pub: Dict) -> Dict:
         "_incorporated":             profile.get("date_of_creation", ""),
         "_ch_url":                   f"https://find-and-update.company-information.service.gov.uk/company/{cn}",
         "_publish_reason":           pub["publish_reason"],
+        "Timestamp":                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "_added_at":                 datetime.utcnow().isoformat(),
     }
 
@@ -620,6 +621,7 @@ def render_kpis(df: pd.DataFrame) -> None:
 
 
 _TABLE_COLS = [
+    "Timestamp",
     "Company Name",
     "Director Nationality",
     "Director Residency",
@@ -678,6 +680,8 @@ def render_results(df: pd.DataFrame) -> None:
             & (view["Director Residency"] == "—")
         ]
 
+    if "_added_at" in view.columns:
+        view = view.sort_values("_added_at", ascending=False).reset_index(drop=True)
     cols = [c for c in _TABLE_COLS if c in view.columns]
     st.dataframe(view[cols], use_container_width=True, height=560)
     st.caption(f"Showing {len(view)} of {len(df)} companies after filters.")
