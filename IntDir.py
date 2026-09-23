@@ -879,17 +879,17 @@ def main() -> None:
     default_end = today - timedelta(days=1)
     default_start = default_end - timedelta(days=6)
     
-    sidebar_result = render_sidebar(default_start, default_end)
-    start_date = sidebar_result[0]
-    end_date = sidebar_result[1]
-    run = sidebar_result[2]
-    force_refresh = sidebar_result[3]
-    selected_signals = sidebar_result[4]
-    sic_search = sidebar_result[5]
-    company_name_search = sidebar_result[6]
-    shortlisted_only = sidebar_result[7]
-    min_directors = sidebar_result[8]
-    max_directors = sidebar_result[9]
+    result = render_sidebar(default_start, default_end)
+    start_date = result[0]
+    end_date = result[1]
+    run = result[2]
+    force_refresh = result[3]
+    selected_signals = result[4]
+    sic_search = result[5]
+    company_name_search = result[6]
+    shortlisted_only = result[7]
+    min_directors = result[8]
+    max_directors = result[9]
 
     if start_date > end_date:
         st.error("The start date must be on or before the end date.")
