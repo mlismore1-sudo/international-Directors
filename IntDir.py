@@ -18,7 +18,7 @@ st.set_page_config(
 
 BASE_URL = "https://api.company-information.service.gov.uk"
 DB_PATH = "companies_house_screening.db"
-SEARCH_PAGE_SIZE = 5000
+SEARCH_PAGE_SIZE = 100  # Reduced from 5000 - API max is typically 100
 OFFICERS_PAGE_SIZE = 100
 PSC_PAGE_SIZE = 100
 ALLOWED_SIC_CODES = [
@@ -246,7 +246,7 @@ class CHClient:
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         last_error = None
-        for _ in range(max(len(self.api_keys) * 3, 3)):
+        for attempt in range(max(len(self.api_keys) * 3, 3)):
             try:
                 response = self.session.get(
                     f"{BASE_URL}{path}",
@@ -255,20 +255,28 @@ class CHClient:
                     timeout=30,
                     headers={"Accept": "application/json"},
                 )
+                
+                # Log response for debugging
+                if response.status_code != 200:
+                    st.warning(f"API Response {response.status_code} on attempt {attempt + 1}: {path}")
+                
                 if response.status_code == 404:
                     return {}
                 if response.status_code in (401, 403, 429):
                     last_error = f"HTTP {response.status_code}"
                     self._rotate()
-                    time.sleep(0.5)
+                    time.sleep(1.0)
                     continue
                 response.raise_for_status()
                 return response.json()
             except requests.RequestException as exc:
                 last_error = str(exc)
                 self._rotate()
-                time.sleep(0.5)
-        raise RuntimeError(f"Companies House API request failed after retries: {last_error}")
+                time.sleep(1.0)
+        
+        error_msg = f"Companies House API request failed after retries: {last_error}"
+        st.error(error_msg)
+        raise RuntimeError(error_msg)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -308,10 +316,13 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
-def existing_company_numbers(conn: sqlite3.Connection, incorporation_date: str) -> set:
+def existing_company_numbers(conn: sqlite3.Connection, start_date: str, end_date: str) -> set:
     rows = conn.execute(
-        "SELECT company_number FROM screened_companies WHERE incorporation_date = ?",
-        (incorporation_date,),
+        """
+        SELECT company_number FROM screened_companies 
+        WHERE incorporation_date BETWEEN ? AND ?
+        """,
+        (start_date, end_date),
     ).fetchall()
     return {r[0] for r in rows}
 
@@ -394,7 +405,10 @@ def validate_api_keys() -> List[str]:
 def paged_get_items(client: CHClient, path: str, page_size: int, extra_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     start_index = 0
-    while True:
+    max_pages = 100  # Safety limit
+    
+    page_count = 0
+    while page_count < max_pages:
         params = {"start_index": start_index}
         if extra_params:
             params.update(extra_params)
@@ -402,16 +416,22 @@ def paged_get_items(client: CHClient, path: str, page_size: int, extra_params: O
             params["size"] = page_size
         else:
             params["items_per_page"] = page_size
+        
         payload = client.get(path, params=params)
         batch = payload.get("items", []) or []
         items.extend(batch)
+        
         total = payload.get("total_results")
         if total is None:
             total = payload.get("total_count")
         total = int(total or len(items))
-        start_index += page_size
-        if not batch or start_index >= total:
+        
+        if not batch or start_index + page_size >= total:
             break
+            
+        start_index += page_size
+        page_count += 1
+    
     return items
 
 
@@ -427,7 +447,9 @@ def search_new_companies(client: CHClient, target_date: str) -> Tuple[List[Dict[
         "company_type": ",".join(ALLOWED_COMPANY_TYPES),
         "sic_codes": ",".join(ALLOWED_SIC_CODES),
     }
+    
     items = paged_get_items(client, "/advanced-search/companies", SEARCH_PAGE_SIZE, params)
+    
     filtered: List[Dict[str, Any]] = []
     for item in items:
         item_sics = [str(x) for x in (item.get("sic_codes") or [])]
@@ -438,11 +460,13 @@ def search_new_companies(client: CHClient, target_date: str) -> Tuple[List[Dict[
         if not is_allowed_company_type(item.get("company_type", "")):
             continue
         filtered.append(item)
+    
     deduped = {}
     for item in filtered:
         number = item.get("company_number")
         if number:
             deduped[number] = item
+    
     diagnostics = {
         "raw_results": len(items),
         "filtered_results": len(filtered),
@@ -757,6 +781,25 @@ def render_sidebar(default_start_date: date, default_end_date: date) -> Tuple[da
     return start_date, end_date, run, selected_signals, sic_search, company_name_search, only_flagged, shortlisted_only, min_directors, max_directors
 
 
+def test_api_connection(client: CHClient, test_date: str) -> bool:
+    """Test if API is working with a simple query"""
+    try:
+        params = {
+            "incorporated_from": test_date,
+            "incorporated_to": test_date,
+            "company_status": "active",
+            "size": 5,
+        }
+        
+        response = client.get("/advanced-search/companies", params=params)
+        total = response.get("total_results", 0)
+        st.success(f"✅ API connection successful! Found {total:,} companies for {test_date}")
+        return True
+    except Exception as e:
+        st.error(f"❌ API connection failed: {str(e)}")
+        return False
+
+
 def main() -> None:
     apply_custom_css()
     
@@ -777,8 +820,9 @@ def main() -> None:
 
     try:
         api_keys = validate_api_keys()
+        st.success(f"✅ Loaded {len(api_keys)} API key(s)")
     except Exception as exc:
-        st.error(str(exc))
+        st.error(f"❌ {str(exc)}")
         st.stop()
 
     conn = init_db()
@@ -786,7 +830,7 @@ def main() -> None:
 
     today = date.today()
     default_start = today - timedelta(days=7)
-    default_end = today
+    default_end = today - timedelta(days=1)  # Exclude today as data may not be available
     
     start_date, end_date, run, selected_signals, sic_search, company_name_search, only_flagged, shortlisted_only, min_directors, max_directors = render_sidebar(
         default_start, default_end
@@ -796,6 +840,22 @@ def main() -> None:
     end_date_str = end_date.strftime("%Y-%m-%d")
     
     date_range_label = f"{start_date_str} to {end_date_str}" if start_date != end_date else start_date_str
+
+    # Add API test button
+    with st.expander("🔧 Debug & Testing", expanded=False):
+        st.markdown("**Test API Connection**")
+        test_date = st.date_input("Test date", value=today - timedelta(days=1))
+        if st.button("Run API Test"):
+            test_api_connection(client, test_date.strftime("%Y-%m-%d"))
+        
+        st.markdown("---")
+        st.markdown("**Troubleshooting Tips:**")
+        st.markdown("""
+        1. **No results?** Try a broader date range or check if companies were incorporated
+        2. **API errors?** Check your API key is valid at https://find-and-update.company-information.service.gov.uk/developer
+        3. **Slow performance?** Reduce the date range or increase page size limits
+        4. **Check database:** Run the test script to verify connectivity
+        """)
 
     if run:
         failures: List[str] = []
@@ -815,8 +875,15 @@ def main() -> None:
                 day_progress = st.empty()
                 day_progress.info(f"Processing {date_str}...")
                 
-                companies, diagnostics = search_new_companies(client, date_str)
-                all_companies.extend(companies)
+                try:
+                    companies, diagnostics = search_new_companies(client, date_str)
+                    all_companies.extend(companies)
+                    
+                    if diagnostics['raw_results'] > 0:
+                        st.write(f"📊 {date_str}: {diagnostics['raw_results']} raw, {diagnostics['deduped_results']} after filtering")
+                except Exception as e:
+                    st.error(f"Error on {date_str}: {str(e)}")
+                    failures.append(f"{date_str}: {str(e)}")
                 
                 companies_enriched += len(companies)
                 progress = ((current_date - start_date).days + 1) / total_days
@@ -828,37 +895,36 @@ def main() -> None:
             
             st.write(f"📊 **Total raw search results:** {len(all_companies):,}")
             
-            already_seen = set()
-            for company in all_companies:
-                number = company.get("company_number")
-                if number:
-                    already_seen.add(number)
-            
+            already_seen = existing_company_numbers(conn, start_date_str, end_date_str)
             new_companies = [c for c in all_companies if c.get("company_number") not in already_seen]
             st.write(f"✨ **New companies to enrich:** {len(new_companies):,}")
+            st.write(f"💾 **Already in database:** {len(already_seen):,}")
 
-            enrich_progress = st.progress(0)
-            total = max(len(new_companies), 1)
-            
-            for idx, item in enumerate(new_companies, start=1):
-                company_number = item.get("company_number", "unknown")
-                try:
-                    row = process_company(client, item, item.get("incorporation_date", start_date_str))
-                    upsert_company(conn, row)
-                except Exception as exc:
-                    failures.append(f"{company_number}: {exc}")
-                enrich_progress.progress(min(idx / total, 1.0))
+            if new_companies:
+                enrich_progress = st.progress(0)
+                total = max(len(new_companies), 1)
+                
+                for idx, item in enumerate(new_companies, start=1):
+                    company_number = item.get("company_number", "unknown")
+                    try:
+                        row = process_company(client, item, item.get("incorporation_date", start_date_str))
+                        upsert_company(conn, row)
+                    except Exception as exc:
+                        failures.append(f"{company_number}: {exc}")
+                    enrich_progress.progress(min(idx / total, 1.0))
 
-            enrich_progress.empty()
+                enrich_progress.empty()
+            else:
+                st.info("ℹ️ No new companies to enrich - all already in database")
             
             if failures:
-                st.warning(f"⚠️ Failed enrichments: {len(failures)}")
+                st.warning(f"⚠️ Failed operations: {len(failures)}")
                 with st.expander("View errors"):
                     st.code("\n".join(failures[:50]))
                 status.update(label="✅ Completed with some errors", state="error")
             else:
                 status.update(label="✅ Refresh complete", state="complete")
-                st.success(f"Successfully enriched {companies_enriched:,} companies!")
+                st.success(f"Successfully processed {companies_enriched:,} companies!")
 
     db_df = read_db_rows(conn, start_date_str, end_date_str)
     display_df = build_display_df(db_df)
@@ -893,6 +959,16 @@ def main() -> None:
     with tab_results:
         st.subheader("📋 Results Table")
         st.caption(f"📅 Date range: **{date_range_label}** | 🔑 {len(api_keys)} API key(s) | 📄 {len(filtered_df):,} rows visible after filters")
+
+        if filtered_df.empty:
+            st.warning("""
+            **No results to display.** This could mean:
+            - No companies in database for this date range
+            - Your filters are too restrictive
+            - You haven't run the pull yet for these dates
+            
+            Try clicking **🚀 Pull New Companies** in the sidebar, or adjust your filters.
+            """)
 
         editor_df = filtered_df[[
             "Shortlist", "Target SIC", "Rating", "Directors", "Company Name", "SIC Code", "Signals",
@@ -1014,6 +1090,7 @@ def main() -> None:
             - ✅ **Shortlist workflow** - build follow-up queues
             - ✅ **Target SIC tagging** - automatically highlight priority SICs
             - ✅ **Rating system** - star-based scoring for prioritization
+            - ✅ **API testing** - built-in debug tools to verify connectivity
             """
         )
         
