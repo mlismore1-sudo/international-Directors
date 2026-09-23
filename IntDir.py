@@ -2,7 +2,7 @@ import json
 import re
 import sqlite3
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -10,7 +10,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Companies House New Incorporations Screener", layout="wide")
+st.set_page_config(
+    page_title="Companies House New Incorporations Screener",
+    layout="wide",
+    page_icon="🏢"
+)
 
 BASE_URL = "https://api.company-information.service.gov.uk"
 DB_PATH = "companies_house_screening.db"
@@ -105,13 +109,19 @@ def apply_custom_css() -> None:
         """
         <style>
         [data-testid="stSidebar"][aria-expanded="true"] > div:first-child {
-            width: 340px;
+            width: 380px;
         }
         div[data-testid="metric-container"] {
             background: linear-gradient(180deg, rgba(14, 17, 23, 0.03), rgba(14, 17, 23, 0.01));
             border: 1px solid rgba(120, 120, 120, 0.18);
-            padding: 14px 16px;
+            padding: 16px 18px;
             border-radius: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            transition: transform 0.2s ease;
+        }
+        div[data-testid="metric-container"]:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
         }
         .signal-legend {
             display: flex;
@@ -122,16 +132,27 @@ def apply_custom_css() -> None:
         .signal-pill {
             border: 1px solid rgba(120, 120, 120, 0.2);
             border-radius: 999px;
-            padding: 6px 10px;
+            padding: 6px 12px;
             font-size: 0.85rem;
             background: rgba(49, 51, 63, 0.04);
+            transition: background 0.2s ease;
+        }
+        .signal-pill:hover {
+            background: rgba(49, 51, 63, 0.08);
         }
         .app-note {
-            padding: 0.85rem 1rem;
+            padding: 1rem 1.25rem;
             border-radius: 12px;
             border: 1px solid rgba(120, 120, 120, 0.18);
-            background: rgba(49, 51, 63, 0.04);
-            margin-bottom: 1rem;
+            background: linear-gradient(135deg, rgba(49, 51, 63, 0.04), rgba(49, 51, 63, 0.02));
+            margin-bottom: 1.25rem;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 8px;
+            padding: 8px 16px;
         }
         </style>
         """,
@@ -271,7 +292,8 @@ def init_db() -> sqlite3.Connection:
             international_shareholder INTEGER,
             owned_by_company INTEGER,
             pulled_at TEXT,
-            raw_json TEXT
+            raw_json TEXT,
+            director_count INTEGER DEFAULT 0
         )
         """
     )
@@ -282,6 +304,7 @@ def init_db() -> sqlite3.Connection:
     ensure_column(conn, "screened_companies", "profile_url", "TEXT")
     ensure_column(conn, "screened_companies", "shortlisted", "INTEGER DEFAULT 0")
     ensure_column(conn, "screened_companies", "target_sic", "INTEGER DEFAULT 0")
+    ensure_column(conn, "screened_companies", "director_count", "INTEGER DEFAULT 0")
     return conn
 
 
@@ -309,8 +332,8 @@ def upsert_company(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
             international_director, international_director_detail,
             international_shareholder, international_shareholder_detail,
             owned_by_company, owner_company_name,
-            pulled_at, raw_json, profile_url, shortlisted, target_sic
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pulled_at, raw_json, profile_url, shortlisted, target_sic, director_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["company_number"],
@@ -329,17 +352,32 @@ def upsert_company(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
             row.get("profile_url", ""),
             int(row.get("shortlisted", False)),
             int(row.get("target_sic", False)),
+            row.get("director_count", 0),
         ),
     )
     conn.commit()
 
 
-def read_db_rows(conn: sqlite3.Connection, incorporation_date: Optional[str] = None) -> pd.DataFrame:
-    if incorporation_date:
+def read_db_rows(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> pd.DataFrame:
+    if start_date and end_date:
+        return pd.read_sql_query(
+            """
+            SELECT * FROM screened_companies 
+            WHERE incorporation_date BETWEEN ? AND ?
+            ORDER BY incorporation_date DESC, pulled_at DESC
+            """,
+            conn,
+            params=(start_date, end_date),
+        )
+    elif start_date:
         return pd.read_sql_query(
             "SELECT * FROM screened_companies WHERE incorporation_date = ? ORDER BY pulled_at DESC",
             conn,
-            params=(incorporation_date,),
+            params=(start_date,),
         )
     return pd.read_sql_query("SELECT * FROM screened_companies ORDER BY pulled_at DESC", conn)
 
@@ -423,13 +461,21 @@ def get_all_pscs(client: CHClient, company_number: str) -> List[Dict[str, Any]]:
     return paged_get_items(client, f"/company/{company_number}/persons-with-significant-control", PSC_PAGE_SIZE)
 
 
-def collect_international_director_details(client: CHClient, company_number: str) -> Tuple[bool, List[str]]:
+def collect_international_director_details(
+    client: CHClient, 
+    company_number: str
+) -> Tuple[bool, List[str], int]:
     officers = get_all_officers(client, company_number)
     matches: List[str] = []
+    director_count = 0
+    
     for officer in officers:
         role = normalize_text(officer.get("officer_role"))
         if "director" not in role and role != "designated member":
             continue
+        
+        director_count += 1
+        
         for value in [
             officer.get("country_of_residence"),
             (officer.get("address") or {}).get("country"),
@@ -437,8 +483,9 @@ def collect_international_director_details(client: CHClient, company_number: str
         ]:
             if canonical_country_from_value(value):
                 matches.append(str(value))
+    
     deduped = dedupe_preserve_order(matches)
-    return bool(deduped), deduped
+    return bool(deduped), deduped, director_count
 
 
 def analyse_psc_flags(client: CHClient, company_number: str) -> Tuple[bool, List[str], bool, List[str]]:
@@ -504,8 +551,12 @@ def build_rating(
 def process_company(client: CHClient, item: Dict[str, Any], target_date: str) -> Dict[str, Any]:
     company_number = item.get("company_number", "")
     company_name = item.get("company_name") or item.get("title") or ""
-    international_director, director_details = collect_international_director_details(client, company_number)
-    international_shareholder, shareholder_details, owned_by_company, owner_names = analyse_psc_flags(client, company_number)
+    international_director, director_details, director_count = collect_international_director_details(
+        client, company_number
+    )
+    international_shareholder, shareholder_details, owned_by_company, owner_names = analyse_psc_flags(
+        client, company_number
+    )
     target_sic = is_target_sic(item)
     owner_display = " | ".join([f"✓ {name}" for name in owner_names]) if owner_names else ""
     return {
@@ -525,13 +576,14 @@ def process_company(client: CHClient, item: Dict[str, Any], target_date: str) ->
         "profile_url": make_company_profile_url(company_number, company_name),
         "shortlisted": False,
         "target_sic": target_sic,
+        "director_count": director_count,
     }
 
 
 def build_display_df(db_df: pd.DataFrame) -> pd.DataFrame:
     if db_df.empty:
         return pd.DataFrame(columns=[
-            "Shortlist", "Target SIC", "Rating", "Company Name", "SIC Code", "Signals",
+            "Shortlist", "Target SIC", "Rating", "Directors", "Company Name", "SIC Code", "Signals",
             "International Director", "International Shareholder", "Owned By A Company",
             "Profile", "Pulled At", "company_number",
         ])
@@ -572,6 +624,7 @@ def build_display_df(db_df: pd.DataFrame) -> pd.DataFrame:
         "Shortlist": db_df.get("shortlisted", pd.Series(0, index=db_df.index)).fillna(0).astype(int).astype(bool),
         "Target SIC": target_sic_series.map(lambda x: "🎯" if x else ""),
         "Rating": rating_series,
+        "Directors": db_df.get("director_count", pd.Series(0, index=db_df.index)).fillna(0).astype(int),
         "Company Name": db_df["company_name"],
         "SIC Code": db_df["sic_code"],
         "Signals": signal_labels,
@@ -584,7 +637,16 @@ def build_display_df(db_df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def apply_filters(df: pd.DataFrame, only_flagged: bool, selected_signals: List[str], sic_search: str, company_name_search: str, shortlisted_only: bool) -> pd.DataFrame:
+def apply_filters(
+    df: pd.DataFrame,
+    only_flagged: bool,
+    selected_signals: List[str],
+    sic_search: str,
+    company_name_search: str,
+    shortlisted_only: bool,
+    min_directors: Optional[int] = None,
+    max_directors: Optional[int] = None,
+) -> pd.DataFrame:
     filtered = df.copy()
     if shortlisted_only and "Shortlist" in filtered.columns:
         filtered = filtered[filtered["Shortlist"] == True].copy()
@@ -601,6 +663,10 @@ def apply_filters(df: pd.DataFrame, only_flagged: bool, selected_signals: List[s
         filtered = filtered[filtered["SIC Code"].astype(str).str.contains(re.escape(sic_search.strip()), case=False, na=False)].copy()
     if company_name_search.strip():
         filtered = filtered[filtered["Company Name"].astype(str).str.contains(re.escape(company_name_search.strip()), case=False, na=False)].copy()
+    if min_directors is not None:
+        filtered = filtered[filtered["Directors"] >= min_directors].copy()
+    if max_directors is not None:
+        filtered = filtered[filtered["Directors"] <= max_directors].copy()
     return filtered
 
 
@@ -613,48 +679,100 @@ def render_kpis(display_df: pd.DataFrame) -> None:
                    (display_df["Owned By A Company"].astype(str).str.startswith("✓", na=False))).sum()) if not display_df.empty else 0
     shortlisted = int(display_df["Shortlist"].sum()) if not display_df.empty else 0
     target_sics = int(display_df["Target SIC"].astype(str).eq("🎯").sum()) if not display_df.empty else 0
+    avg_directors = round(display_df["Directors"].mean(), 2) if not display_df.empty else 0
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Total Results", f"{total:,}")
     c2.metric("Flagged Rows", f"{flagged:,}")
     c3.metric("Intl Directors", f"{director:,}")
     c4.metric("Intl Shareholders", f"{shareholder:,}")
     c5.metric("Target SICs", f"{target_sics:,}")
     c6.metric("Shortlisted", f"{shortlisted:,}")
+    c7.metric("Avg Directors", f"{avg_directors}")
 
 
-def render_sidebar(default_date: date) -> Tuple[date, bool, List[str], str, str, bool, bool]:
+def render_sidebar(default_start_date: date, default_end_date: date) -> Tuple[date, date, bool, List[str], str, str, bool, bool, Optional[int], Optional[int]]:
     with st.sidebar:
-        st.header("Screening controls")
-        target_date = st.date_input("Incorporation date", value=default_date, format="YYYY-MM-DD")
-        run = st.button("Pull new companies", type="primary", use_container_width=True)
+        st.header("🎛️ Screening Controls")
+        
+        st.markdown("### 📅 Date Range")
+        date_range = st.date_input(
+            "Select incorporation date range",
+            value=(default_start_date, default_end_date),
+            format="YYYY-MM-DD",
+            help="Select a start and end date to screen companies incorporated within this period"
+        )
+        
+        start_date = default_start_date
+        end_date = default_end_date
+        
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+            if start_date > end_date:
+                st.error("⚠️ Start date must be before end date")
+                start_date, end_date = end_date, start_date
+        elif isinstance(date_range, date):
+            start_date = end_date = date_range
+        
+        run = st.button("🚀 Pull New Companies", type="primary", use_container_width=True)
+        
         st.divider()
-        st.subheader("Result filters")
+        
+        st.subheader("🔍 Result Filters")
         only_flagged = st.checkbox("Show only flagged rows", value=False)
-        selected_signals = st.multiselect("Signals", options=SIGNAL_OPTIONS, default=SIGNAL_OPTIONS)
+        selected_signals = st.multiselect(
+            "Signals",
+            options=SIGNAL_OPTIONS,
+            default=SIGNAL_OPTIONS,
+            help="Filter by international signals"
+        )
+        
+        st.markdown("### 👥 Director Count Filter")
+        director_range = st.slider(
+            "Number of directors",
+            min_value=0,
+            max_value=20,
+            value=(0, 20),
+            help="Filter companies by number of directors"
+        )
+        min_directors = director_range[0] if director_range[0] > 0 else None
+        max_directors = director_range[1] if director_range[1] < 20 else None
+        
         sic_search = st.text_input("Filter by SIC code", placeholder="e.g. 62012")
         company_name_search = st.text_input("Filter by company name", placeholder="e.g. Labs")
         shortlisted_only = st.checkbox("Show shortlisted only", value=False)
+        
         st.divider()
+        
+        with st.expander("💡 Quick Tips"):
+            st.markdown("""
+            - Use **date range** to screen multiple days at once
+            - Filter by **director count** to find companies with specific team sizes
+            - **Shortlist** promising companies for follow-up
+            - Click **Profile** links to view Companies House records
+            """)
+        
         st.caption("The sidebar keeps controls separate from the results table for faster screening.")
-    return target_date, run, selected_signals, sic_search, company_name_search, only_flagged, shortlisted_only
+    
+    return start_date, end_date, run, selected_signals, sic_search, company_name_search, only_flagged, shortlisted_only, min_directors, max_directors
 
 
 def main() -> None:
     apply_custom_css()
-    st.title("Companies House New Incorporations Screener")
+    
+    st.title("🏢 Companies House New Incorporations Screener")
     st.caption("Pull newly incorporated active companies, screen target SIC codes, and enrich results with officer and PSC checks.")
 
     st.markdown(
         """
         <div class="app-note">
-        Designed for rapid lead triage: run the pull, scan KPIs, filter the signals, shortlist candidates, and click through to Companies House profiles.
+        <strong>🎯 Designed for rapid lead triage:</strong> run the pull, scan KPIs, filter the signals, shortlist candidates, and click through to Companies House profiles.
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.expander("Secrets format", expanded=False):
+    with st.expander("🔑 Secrets Format", expanded=False):
         st.code('COMPANIES_HOUSE_API_KEYS = [\n  "key-1",\n  "key-2",\n  "key-3"\n]', language="toml")
 
     try:
@@ -666,52 +784,94 @@ def main() -> None:
     conn = init_db()
     client = CHClient(api_keys)
 
-    target_date, run, selected_signals, sic_search, company_name_search, only_flagged, shortlisted_only = render_sidebar(date.today())
-    date_str = target_date.strftime("%Y-%m-%d")
+    today = date.today()
+    default_start = today - timedelta(days=7)
+    default_end = today
+    
+    start_date, end_date, run, selected_signals, sic_search, company_name_search, only_flagged, shortlisted_only, min_directors, max_directors = render_sidebar(
+        default_start, default_end
+    )
+    
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+    
+    date_range_label = f"{start_date_str} to {end_date_str}" if start_date != end_date else start_date_str
 
     if run:
         failures: List[str] = []
-        with st.status("Running Companies House screening...", expanded=True) as status:
-            st.write("Querying advanced search with all SIC codes and company types in one request pattern.")
-            companies, diagnostics = search_new_companies(client, date_str)
-            already_seen = existing_company_numbers(conn, date_str)
-            new_companies = [c for c in companies if c.get("company_number") not in already_seen]
-            st.write(f"Raw search results: {diagnostics['raw_results']}")
-            st.write(f"Filtered results retained: {diagnostics['filtered_results']}")
-            st.write(f"Deduped company numbers: {diagnostics['deduped_results']}")
-            st.write(f"Already screened for {date_str}: {len(already_seen)}")
-            st.write(f"New companies to enrich: {len(new_companies)}")
+        companies_enriched = 0
+        
+        with st.status(f"🔍 Running Companies House screening for {date_range_label}...", expanded=True) as status:
+            st.write(f"Querying advanced search with all SIC codes and company types for date range: **{date_range_label}**")
+            
+            current_date = start_date
+            all_companies = []
+            
+            progress_bar = st.progress(0)
+            total_days = (end_date - start_date).days + 1
+            
+            while current_date <= end_date:
+                date_str = current_date.strftime("%Y-%m-%d")
+                day_progress = st.empty()
+                day_progress.info(f"Processing {date_str}...")
+                
+                companies, diagnostics = search_new_companies(client, date_str)
+                all_companies.extend(companies)
+                
+                companies_enriched += len(companies)
+                progress = ((current_date - start_date).days + 1) / total_days
+                progress_bar.progress(progress)
+                
+                current_date += timedelta(days=1)
+            
+            progress_bar.empty()
+            
+            st.write(f"📊 **Total raw search results:** {len(all_companies):,}")
+            
+            already_seen = set()
+            for company in all_companies:
+                number = company.get("company_number")
+                if number:
+                    already_seen.add(number)
+            
+            new_companies = [c for c in all_companies if c.get("company_number") not in already_seen]
+            st.write(f"✨ **New companies to enrich:** {len(new_companies):,}")
 
-            progress = st.progress(0)
+            enrich_progress = st.progress(0)
             total = max(len(new_companies), 1)
+            
             for idx, item in enumerate(new_companies, start=1):
                 company_number = item.get("company_number", "unknown")
                 try:
-                    row = process_company(client, item, date_str)
+                    row = process_company(client, item, item.get("incorporation_date", start_date_str))
                     upsert_company(conn, row)
                 except Exception as exc:
                     failures.append(f"{company_number}: {exc}")
-                progress.progress(min(idx / total, 1.0))
+                enrich_progress.progress(min(idx / total, 1.0))
 
+            enrich_progress.empty()
+            
             if failures:
-                st.warning(f"Failed enrichments: {len(failures)}")
-                st.code("\n".join(failures[:50]))
-                status.update(label="Completed with some errors", state="error")
+                st.warning(f"⚠️ Failed enrichments: {len(failures)}")
+                with st.expander("View errors"):
+                    st.code("\n".join(failures[:50]))
+                status.update(label="✅ Completed with some errors", state="error")
             else:
-                status.update(label="Refresh complete", state="complete")
+                status.update(label="✅ Refresh complete", state="complete")
+                st.success(f"Successfully enriched {companies_enriched:,} companies!")
 
-    db_df = read_db_rows(conn, date_str)
+    db_df = read_db_rows(conn, start_date_str, end_date_str)
     display_df = build_display_df(db_df)
     render_kpis(display_df)
 
     st.markdown(
         """
         <div class="signal-legend">
-            <div class="signal-pill">Director 🌍 = international director match</div>
-            <div class="signal-pill">Shareholder 🌍 = international PSC match</div>
-            <div class="signal-pill">Company owner 🏢 = corporate PSC match</div>
-            <div class="signal-pill">Target SIC 🎯 = SIC 62012, 72110, or 56101</div>
-            <div class="signal-pill">Rating ⭐ = 1 star per signal, plus a bonus for Sweden, Norway, or USA director/shareholder</div>
+            <div class="signal-pill">🌍 Director = international director match</div>
+            <div class="signal-pill">🌍 Shareholder = international PSC match</div>
+            <div class="signal-pill">🏢 Company owner = corporate PSC match</div>
+            <div class="signal-pill">🎯 Target SIC = SIC 62012, 72110, or 56101</div>
+            <div class="signal-pill">⭐ Rating = 1 star per signal, plus bonus for Sweden, Norway, or USA</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -724,16 +884,18 @@ def main() -> None:
         sic_search=sic_search,
         company_name_search=company_name_search,
         shortlisted_only=shortlisted_only,
+        min_directors=min_directors,
+        max_directors=max_directors,
     )
 
-    tab_results, tab_shortlist, tab_settings = st.tabs(["Results", "Shortlist", "Settings"])
+    tab_results, tab_shortlist, tab_settings = st.tabs(["📊 Results", "⭐ Shortlist", "⚙️ Settings"])
 
     with tab_results:
-        st.subheader("Results")
-        st.caption(f"Loaded {len(api_keys)} API key(s) for {date_str}. {len(filtered_df):,} rows currently visible after filters.")
+        st.subheader("📋 Results Table")
+        st.caption(f"📅 Date range: **{date_range_label}** | 🔑 {len(api_keys)} API key(s) | 📄 {len(filtered_df):,} rows visible after filters")
 
         editor_df = filtered_df[[
-            "Shortlist", "Target SIC", "Rating", "Company Name", "SIC Code", "Signals",
+            "Shortlist", "Target SIC", "Rating", "Directors", "Company Name", "SIC Code", "Signals",
             "International Director", "International Shareholder", "Owned By A Company",
             "Profile", "Pulled At", "company_number",
         ]].copy()
@@ -743,7 +905,7 @@ def main() -> None:
             use_container_width=True,
             hide_index=True,
             disabled=[
-                "Target SIC", "Rating", "Company Name", "SIC Code", "Signals",
+                "Target SIC", "Rating", "Directors", "Company Name", "SIC Code", "Signals",
                 "International Director", "International Shareholder", "Owned By A Company",
                 "Profile", "Pulled At", "company_number",
             ],
@@ -751,17 +913,18 @@ def main() -> None:
                 "Shortlist": st.column_config.CheckboxColumn("Shortlist", help="Tick to mark this company for follow-up."),
                 "Target SIC": st.column_config.TextColumn("Target SIC", width="small", help="Automatically marked 🎯 when SIC includes 62012, 72110, or 56101."),
                 "Rating": st.column_config.TextColumn("Rating", width="small", help="⭐ for each matched signal, plus a bonus ⭐ for Sweden, Norway, or USA director/shareholder."),
+                "Directors": st.column_config.NumberColumn("Directors", width="small", help="Total number of directors for this company"),
                 "Company Name": st.column_config.TextColumn("Company Name", width="large"),
                 "SIC Code": st.column_config.TextColumn("SIC Code", width="small"),
                 "Signals": st.column_config.TextColumn("Signals", width="medium"),
                 "International Director": st.column_config.TextColumn("International Director", width="large"),
                 "International Shareholder": st.column_config.TextColumn("International Shareholder", width="large"),
                 "Owned By A Company": st.column_config.TextColumn("Owned By A Company", width="large"),
-                "Profile": st.column_config.LinkColumn("Profile", display_text="Open record", width="small"),
+                "Profile": st.column_config.LinkColumn("Profile", display_text="🔗 Open", width="small"),
                 "Pulled At": st.column_config.TextColumn("Pulled At", width="medium"),
                 "company_number": None,
             },
-            key=f"results_editor_{date_str}",
+            key=f"results_editor_{start_date_str}_{end_date_str}",
         )
 
         if not edited_df.empty:
@@ -775,55 +938,86 @@ def main() -> None:
             for _, row in changed_rows.iterrows():
                 set_shortlisted_state(conn, row["company_number"], bool(row["Shortlist_new"]))
             if not changed_rows.empty:
-                st.success(f"Updated shortlist state for {len(changed_rows)} compan{'y' if len(changed_rows) == 1 else 'ies'}.")
+                st.success(f"✅ Updated shortlist state for {len(changed_rows)} compan{'y' if len(changed_rows) == 1 else 'ies'}.")
                 st.rerun()
 
         csv = filtered_df.drop(columns=["company_number"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download filtered CSV",
+            "📥 Download Filtered CSV",
             data=csv,
-            file_name=f"companies_house_screening_{date_str}.csv",
+            file_name=f"companies_house_screening_{start_date_str}_to_{end_date_str}.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
     with tab_shortlist:
-        st.subheader("Shortlist")
+        st.subheader("⭐ Shortlisted Companies")
         shortlist_df = display_df[display_df["Shortlist"] == True].copy()
         if shortlist_df.empty:
-            st.info("No shortlisted companies yet. Tick the shortlist checkbox in the Results tab to build a follow-up queue.")
+            st.info("📭 No shortlisted companies yet. Tick the shortlist checkbox in the Results tab to build a follow-up queue.")
         else:
+            st.metric("Shortlisted Count", len(shortlist_df))
             st.dataframe(
                 shortlist_df.drop(columns=["company_number"], errors="ignore"),
                 use_container_width=True,
                 hide_index=True,
-                column_config={"Profile": st.column_config.LinkColumn("Profile", display_text="Open record")},
+                column_config={"Profile": st.column_config.LinkColumn("Profile", display_text="🔗 Open")},
             )
             shortlist_csv = shortlist_df.drop(columns=["company_number"], errors="ignore").to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download shortlist CSV",
+                "📥 Download Shortlist CSV",
                 data=shortlist_csv,
-                file_name=f"companies_house_shortlist_{date_str}.csv",
+                file_name=f"companies_house_shortlist_{start_date_str}_to_{end_date_str}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
 
     with tab_settings:
-        st.subheader("Current search settings")
+        st.subheader("⚙️ Current Search Settings")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Search Configuration**")
+            st.markdown(
+                f"""
+                - Company status: **Active**
+                - Company types: `{', '.join(ALLOWED_COMPANY_TYPES)}`
+                - SIC codes: **{len(ALLOWED_SIC_CODES)}** values
+                - Target SIC codes: `{', '.join(sorted(TARGET_SIC_CODES))}`
+                """
+            )
+        
+        with col2:
+            st.markdown("**Pagination Settings**")
+            st.markdown(
+                f"""
+                - Advanced search page size: **{SEARCH_PAGE_SIZE}**
+                - Officers page size: **{OFFICERS_PAGE_SIZE}**
+                - PSC page size: **{PSC_PAGE_SIZE}**
+                """
+            )
+        
+        st.divider()
+        
+        st.markdown("**Features & Workflow**")
         st.markdown(
-            f"""
-- Company status: Active
-- Company types sent to API: `{', '.join(ALLOWED_COMPANY_TYPES)}`
-- SIC codes sent to API: {len(ALLOWED_SIC_CODES)} values
-- Target SIC codes: `{', '.join(sorted(TARGET_SIC_CODES))}`
-- Advanced search page size: {SEARCH_PAGE_SIZE}
-- Officers page size: {OFFICERS_PAGE_SIZE}
-- PSC page size: {PSC_PAGE_SIZE}
-- Dedupe rule: company numbers already screened for the selected incorporation date are skipped
-- UI enhancements: sidebar filters, KPI cards, workflow tabs, clickable profile links, shortlist workflow, target SIC tagging, rating column
+            """
+            - ✅ **Date range screening** - screen multiple days at once
+            - ✅ **Director count display** - see total directors per company
+            - ✅ **Director count filtering** - filter by team size
+            - ✅ **Deduplication** - company numbers already screened are skipped
+            - ✅ **Sidebar filters** - quick access to all controls
+            - ✅ **KPI cards** - instant overview of key metrics
+            - ✅ **Workflow tabs** - organized results, shortlist, and settings
+            - ✅ **Clickable profile links** - direct access to Companies House
+            - ✅ **Shortlist workflow** - build follow-up queues
+            - ✅ **Target SIC tagging** - automatically highlight priority SICs
+            - ✅ **Rating system** - star-based scoring for prioritization
             """
         )
-        st.write("Selected signals for current filter:", ", ".join(selected_signals) if selected_signals else "None")
+        
+        st.write("**Selected signals for current filter:**", ", ".join(selected_signals) if selected_signals else "None")
 
 
 if __name__ == "__main__":
