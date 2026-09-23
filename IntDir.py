@@ -588,7 +588,7 @@ def main():
     with t1:
         st.caption(f"{date_lbl} - {len(filt_df):,} rows")
         ecols = ["Shortlist", "Incorporated", "Target SIC", "Rating", "Directors", "Company Name", "SIC Code", "Signals", "International Director", "International Shareholder", "Owned By A Company", "Profile", "Pulled At", "company_number"]
-        edf = st.data_editor(filt_df[ecols], key=f"ed_{start_str}_{end_str}", use_container_width=True, hide_index=True, disabled=[c for c in ecols if c != "Shortlist"], column_config={"Shortlist": st.column_config.CheckboxColumn("Shortlist"), "Directors": st.column_config.NumberColumn("Directors", "small"), "Profile": st.column_config.LinkColumn("Profile", "Open", "small"), "company_number": None})
+        edf = st.data_editor(filt_df[ecols], key=f"ed_{start_str}_{end_str}", use_container_width=True, hide_index=True, disabled=[c for c in ecols if c != "Shortlist"], column_config={"Shortlist": st.column_config.CheckboxColumn("Shortlist"), "Directors": st.column_config.NumberColumn("Directors"), "Profile": st.column_config.LinkColumn("Profile", "Open"), "company_number": None})
         if not edf.empty:
             chg = edf[["company_number", "Shortlist"]].merge(disp_df[["company_number", "Shortlist"]], on="company_number", suffixes=("_n", "_o"))
             diff = chg[chg["Shortlist_n"] != chg["Shortlist_o"]]
