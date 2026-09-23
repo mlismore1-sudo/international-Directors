@@ -240,15 +240,20 @@ class CHClient:
         raise RuntimeError(f"Companies House API request failed after retries: {last_error}")
 
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        conn.commit()
+def safe_add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Add column if it doesn't exist, ignore if it does"""
+    try:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            conn.commit()
+    except Exception:
+        pass
 
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS screened_companies (
@@ -266,6 +271,7 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
+    
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS screening_runs (
@@ -281,13 +287,14 @@ def init_db() -> sqlite3.Connection:
     )
     conn.commit()
 
-    ensure_column(conn, "screened_companies", "international_director_detail", "TEXT")
-    ensure_column(conn, "screened_companies", "international_shareholder_detail", "TEXT")
-    ensure_column(conn, "screened_companies", "owner_company_name", "TEXT")
-    ensure_column(conn, "screened_companies", "profile_url", "TEXT")
-    ensure_column(conn, "screened_companies", "shortlisted", "INTEGER DEFAULT 0")
-    ensure_column(conn, "screened_companies", "target_sic", "INTEGER DEFAULT 0")
-    ensure_column(conn, "screened_companies", "director_count", "INTEGER DEFAULT 0")
+    safe_add_column(conn, "screened_companies", "international_director_detail", "TEXT")
+    safe_add_column(conn, "screened_companies", "international_shareholder_detail", "TEXT")
+    safe_add_column(conn, "screened_companies", "owner_company_name", "TEXT")
+    safe_add_column(conn, "screened_companies", "profile_url", "TEXT")
+    safe_add_column(conn, "screened_companies", "shortlisted", "INTEGER DEFAULT 0")
+    safe_add_column(conn, "screened_companies", "target_sic", "INTEGER DEFAULT 0")
+    safe_add_column(conn, "screened_companies", "director_count", "INTEGER DEFAULT 0")
+    
     return conn
 
 
@@ -635,14 +642,6 @@ def screen_date_until_complete(
     log: Any,
     progress: Any,
 ) -> Dict[str, int]:
-    """
-    Fetch every page for one incorporation date. Each fetched page is compared to
-    company numbers already persisted before enrichment, so repeated/restarted runs
-    never call officer or PSC endpoints for companies that have been stored already.
-
-    A date is marked complete only after the API's reported result count has been
-    exhausted (or its final partial page has been read).
-    """
     prior_state = get_run_state(conn, target_date)
     if prior_state and prior_state["status"] == "complete":
         return {
